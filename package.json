@@ -11,10 +11,9 @@
     "build": "tsc --noEmit && vite build",
     "build:electron": "npm run build && node scripts/build-electron.mjs",
     "electron:preview": "npm run build:electron && electron .",
-    "dist:mac": "npm run build:electron && electron-builder --mac --config electron-builder.yml",
+    "dist:mac": "npm run build:electron && electron-builder --mac --arm64 --config electron-builder.yml",
     "dist:mac:arm64": "npm run build:electron && electron-builder --mac --arm64 --config electron-builder.yml",
-    "dist:mac:x64": "npm run build:electron && electron-builder --mac --x64 --config electron-builder.yml",
-    "dist:mac:dir": "npm run build:electron && electron-builder --mac --dir --config electron-builder.yml",
+    "dist:mac:dir": "npm run build:electron && electron-builder --mac --arm64 --dir --config electron-builder.yml",
     "lint": "eslint src server.ts server electron",
     "start": "NODE_ENV=production node server.ts",
     "test": "tsx --test src/lib/*.test.ts"
