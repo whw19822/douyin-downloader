@@ -7,7 +7,7 @@ import {
   summarizeJobItems,
 } from '../src/lib/batchRules';
 import { renderNamingTemplate } from '../src/lib/naming';
-import { parseBatchInput, parseDouyinUrl } from '../src/lib/urlParser';
+import { parseBatchInput, resolveParsedLinks } from '../src/lib/urlParser';
 import {
   DEFAULT_BATCH_SETTINGS,
   type ArchiveItem,
@@ -21,7 +21,6 @@ import {
   discoverWorksForLink,
   type CreatorProfileSummary,
 } from './douyinScraper';
-import { resolveDouyinShortUrl } from './douyinService';
 import {
   downloadAwemeMediaToDisk,
   type DownloadedFileRecord,
@@ -183,22 +182,11 @@ class BatchJobStore {
     };
     const { links } = parseBatchInput(rawText);
 
-    const resolvedLinks: ParsedLink[] = await Promise.all(
-      links.map(async (link, idx) => {
-        if (link.type !== 'short') return link;
-        const resolved = await resolveDouyinShortUrl(
-          link.originalUrl,
-          merged.cookieString,
-        );
-        if (!resolved) return link;
-        const reparsed = parseDouyinUrl(resolved, idx);
-        return {
-          ...reparsed,
-          originalUrl: link.originalUrl,
-          resolvedUrl: resolved,
-        };
-      }),
-    );
+    const resolvedLinks: ParsedLink[] = await resolveParsedLinks(links, {
+      cookieString: merged.cookieString,
+      maxRedirects: 5,
+      timeoutMs: 4500,
+    });
 
     const worksMap = new Map<string, DiscoveredWork>();
     const profiles: CreatorProfileSummary[] = [];

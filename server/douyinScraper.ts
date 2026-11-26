@@ -9,6 +9,7 @@ import {
   type RawAweme,
 } from '../src/lib/douyinParser';
 import { isWithinDateRange } from '../src/lib/batchRules';
+import { buildCanonicalDouyinUrl } from '../src/lib/urlParser';
 import type {
   BatchSettings,
   DiscoveredWork,
@@ -139,11 +140,20 @@ export async function fetchSingleAwemeBySharePage(
   awemeId: string,
   quality: VideoQuality,
   cookieString?: string,
+  preferGallery = false,
 ): Promise<ParsedAwemeMedia | null> {
-  const urlsToTry = [
-    `https://www.iesdouyin.com/share/video/${encodeURIComponent(awemeId)}/`,
-    `https://www.iesdouyin.com/share/note/${encodeURIComponent(awemeId)}/`,
-  ];
+  const encodedId = encodeURIComponent(awemeId);
+  const urlsToTry = preferGallery
+    ? [
+        `https://www.iesdouyin.com/share/note/${encodedId}/`,
+        `https://www.iesdouyin.com/share/slides/${encodedId}/`,
+        `https://www.iesdouyin.com/share/video/${encodedId}/`,
+      ]
+    : [
+        `https://www.iesdouyin.com/share/video/${encodedId}/`,
+        `https://www.iesdouyin.com/share/note/${encodedId}/`,
+        `https://www.iesdouyin.com/share/slides/${encodedId}/`,
+      ];
 
   for (const shareUrl of urlsToTry) {
     const controller = new AbortController();
@@ -656,25 +666,28 @@ export async function discoverWorksForLink(
     if (!awemeId) {
       return { works: [], warnings: [`无法从链接中提取作品 ID: ${resolvedUrl}`] };
     }
+    const targetDesktopUrl =
+      buildCanonicalDouyinUrl(link.type, awemeId) || resolvedUrl;
 
     const shareMedia = await fetchSingleAwemeBySharePage(
       awemeId,
       settings.videoQuality,
       settings.cookieString,
+      link.type === 'gallery',
     );
     if (shareMedia) {
       return {
-        works: [mediaToDiscoveredWork(shareMedia, resolvedUrl, 'post')],
+        works: [mediaToDiscoveredWork(shareMedia, targetDesktopUrl, 'post')],
         warnings: [],
       };
     }
 
-    const cdpRes = await scrapePageViaChromium(resolvedUrl, {
+    const cdpRes = await scrapePageViaChromium(targetDesktopUrl, {
       quality: settings.videoQuality,
       cookieString: settings.cookieString,
       mode: 'post',
       maxItems: 1,
-      sourceUrl: resolvedUrl,
+      sourceUrl: targetDesktopUrl,
       paginate: false,
     });
     if (cdpRes.works.length === 0) {
@@ -760,14 +773,16 @@ export async function discoverWorksForLink(
   }
 
   if (link.type === 'collection' || link.type === 'music') {
-    const cdpRes = await scrapePageViaChromium(resolvedUrl, {
+    const targetDesktopUrl =
+      buildCanonicalDouyinUrl(link.type, link.targetId) || resolvedUrl;
+    const cdpRes = await scrapePageViaChromium(targetDesktopUrl, {
       quality: settings.videoQuality,
       cookieString: settings.cookieString,
       mode: link.type === 'collection' ? 'mix' : 'music',
       maxItems: settings.maxItemsPerMode,
       startDate: settings.startDate,
       endDate: settings.endDate,
-      sourceUrl: resolvedUrl,
+      sourceUrl: targetDesktopUrl,
       paginate: true,
     });
     if (cdpRes.works.length === 0) {

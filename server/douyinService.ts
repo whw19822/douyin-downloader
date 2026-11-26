@@ -1,8 +1,8 @@
 import {
   isAllowedDouyinUpstreamHost,
-  isShortUrl,
   normalizeShortUrl,
-  parseDouyinUrl,
+  resolveParsedLinks,
+  resolveShortUrlRedirect,
 } from '../src/lib/urlParser';
 import type { HotBoardItem, ParsedLink } from '../src/lib/types';
 
@@ -77,51 +77,12 @@ export async function resolveDouyinShortUrl(
   rawUrl: string,
   cookieString?: string,
 ): Promise<string | null> {
-  if (!isShortUrl(rawUrl)) return null;
-  const normalized = normalizeShortUrl(rawUrl);
-
-  let parsed: URL;
-  try {
-    parsed = new URL(normalized);
-  } catch {
-    return null;
-  }
-
-  if (!isAllowedDouyinUpstreamHost(parsed.hostname)) {
-    return null;
-  }
-
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 3200);
-  try {
-    const headers: Record<string, string> = {
-      'User-Agent': USER_AGENT,
-      Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-    };
-    if (cookieString?.trim()) {
-      headers.Cookie = cookieString.trim();
-    }
-
-    const response = await fetch(normalized, {
-      method: 'GET',
-      redirect: 'manual',
-      headers,
-      signal: controller.signal,
-    });
-
-    const location = response.headers.get('location');
-    if (location) {
-      const target = new URL(location, normalized);
-      if (isAllowedDouyinUpstreamHost(target.hostname)) {
-        return target.toString();
-      }
-    }
-    return null;
-  } catch {
-    return null;
-  } finally {
-    clearTimeout(timer);
-  }
+  const result = await resolveShortUrlRedirect(rawUrl, {
+    cookieString,
+    maxRedirects: 5,
+    timeoutMs: 4500,
+  });
+  return result?.resolvedUrl ?? null;
 }
 
 export async function probeDouyinPageTitle(
@@ -183,19 +144,11 @@ export async function inspectAndResolveLinks(
   links: ParsedLink[],
   cookieString?: string,
 ): Promise<ParsedLink[]> {
-  return Promise.all(
-    links.map(async (link, idx) => {
-      if (link.type !== 'short') return link;
-      const resolved = await resolveDouyinShortUrl(link.originalUrl, cookieString);
-      if (!resolved) return link;
-      const reparsed = parseDouyinUrl(resolved, idx);
-      return {
-        ...reparsed,
-        originalUrl: link.originalUrl,
-        resolvedUrl: resolved,
-      };
-    }),
-  );
+  return resolveParsedLinks(links, {
+    cookieString,
+    maxRedirects: 5,
+    timeoutMs: 4500,
+  });
 }
 
 let hotBoardCache: {
