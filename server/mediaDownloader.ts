@@ -139,16 +139,35 @@ async function downloadBinaryFile(
 }
 
 export function resolveSafeDownloadRoot(downloadPath: string): string {
-  const baseRoot = path.resolve(process.cwd(), 'Downloaded');
-  const cleaned = (downloadPath || './Downloaded/')
-    .replace(/^\.?\//, '')
-    .replace(/\.\./g, '')
-    .trim();
-  if (!cleaned || cleaned === 'Downloaded' || cleaned === 'Downloaded/') {
+  const desktopMode = process.env.DOUYIN_DESKTOP === '1';
+  const baseRoot = process.env.DOUYIN_DOWNLOAD_BASE_DIR
+    ? path.resolve(process.env.DOUYIN_DOWNLOAD_BASE_DIR)
+    : path.resolve(process.cwd(), 'Downloaded');
+  const raw = (downloadPath || './Downloaded/').trim();
+
+  if (
+    !raw ||
+    raw === './Downloaded/' ||
+    raw === './Downloaded' ||
+    raw === 'Downloaded' ||
+    raw === 'Downloaded/'
+  ) {
     return baseRoot;
   }
-  const candidate = path.resolve(process.cwd(), cleaned);
-  if (!candidate.startsWith(process.cwd())) {
+
+  // In macOS desktop app mode, allow saving directly to user-selected absolute folders
+  if (desktopMode && path.isAbsolute(raw) && !raw.includes('..')) {
+    return path.resolve(raw);
+  }
+
+  const cleaned = raw.replace(/^\.?\//, '').replace(/\.\./g, '').trim();
+  if (!cleaned) {
+    return baseRoot;
+  }
+
+  const anchor = process.env.DOUYIN_DOWNLOAD_BASE_DIR ? baseRoot : process.cwd();
+  const candidate = path.resolve(anchor, cleaned);
+  if (!candidate.startsWith(anchor)) {
     return baseRoot;
   }
   return candidate;

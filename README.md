@@ -25,3 +25,27 @@ npm test
 npm run lint
 npm run build
 ```
+
+## 打包成 macOS 桌面应用（.dmg / .zip）
+
+在 macOS 上（需要 Node.js 20+）运行以下任一命令，打包产物会生成在 `release/` 目录中，并内置本地服务端，下载的媒体文件会直接保存到 `~/Downloads/DouyinBatchStudio`（也可在设置中调用访达自定义目录）：
+
+```bash
+# 安装依赖
+npm install
+
+# 1. 本地预览桌面端窗口
+npm run electron:preview
+
+# 2. 打包 Apple Silicon（M1/M2/M3/M4）Mac 安装包
+npm run dist:mac:arm64
+
+# 3. 打包 Intel Mac 安装包
+npm run dist:mac:x64
+
+# 4. 同时打包 Apple Silicon + Intel 双架构 .dmg 与 .zip
+npm run dist:mac
+```
+
+也可以将代码推送到 GitHub 后，在 Actions 中手动触发 `Build macOS App` 工作流，自动在云端 macOS 环境构建并下载 `.dmg` / `.zip` 安装包。
+

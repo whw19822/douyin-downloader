@@ -1,5 +1,7 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import {
   extractAwemeListFromRouterData,
   extractRouterDataFromHtml,
@@ -40,8 +42,17 @@ export interface DiscoveryResult {
 }
 
 function findChromeBinary(): string | null {
+  const home = os.homedir();
   const candidates = [
     process.env.CHROME_PATH,
+    // macOS standard Chrome / Chromium / Edge / Brave / Arc paths
+    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+    path.join(home, 'Applications/Google Chrome.app/Contents/MacOS/Google Chrome'),
+    '/Applications/Chromium.app/Contents/MacOS/Chromium',
+    '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
+    '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser',
+    '/Applications/Arc.app/Contents/MacOS/Arc',
+    // Linux / container Playwright Chromium paths
     '/ms-playwright/chrome-headless-shell-linux64/chrome-headless-shell',
     '/ms-playwright/chromium_headless_shell-1247/chrome-headless-shell-linux64/chrome-headless-shell',
     '/usr/bin/chromium',

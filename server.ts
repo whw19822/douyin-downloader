@@ -2,6 +2,8 @@ import express from 'express';
 import cors from 'cors';
 import fs from 'node:fs';
 import path from 'node:path';
+import type { Server } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { fileURLToPath } from 'node:url';
 import { parseBatchInput } from './src/lib/urlParser';
 import { validateNamingTemplate } from './src/lib/naming';
@@ -14,10 +16,29 @@ import type { BatchSettings, DiscoveredWork } from './src/lib/types';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const PORT = Number(process.env.PORT || 3000);
-const IS_PROD = process.env.NODE_ENV === 'production';
+export interface ServerStartOptions {
+  port?: number;
+  host?: string;
+  distDir?: string;
+  isProd?: boolean;
+}
 
-async function startServer() {
+export interface StartedServerHandle {
+  app: express.Express;
+  server: Server;
+  port: number;
+  host: string;
+  close: () => Promise<void>;
+}
+
+export async function createAndStartServer(
+  options: ServerStartOptions = {},
+): Promise<StartedServerHandle> {
+  const port = options.port ?? Number(process.env.PORT || 3000);
+  const host = options.host ?? '0.0.0.0';
+  const isProd = options.isProd ?? process.env.NODE_ENV === 'production';
+  const distDir = options.distDir ?? path.join(__dirname, 'dist');
+
   const app = express();
   app.use(cors());
   app.use(express.json({ limit: '6mb' }));
@@ -338,7 +359,7 @@ async function startServer() {
     res.json(result);
   });
 
-  if (!IS_PROD) {
+  if (!isProd) {
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true, hmr: false },
@@ -346,19 +367,36 @@ async function startServer() {
     });
     app.use(vite.middlewares);
   } else {
-    const distDir = path.join(__dirname, 'dist');
     app.use(express.static(distDir));
     app.get('*', (_req, res) => {
       res.sendFile(path.join(distDir, 'index.html'));
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Douyin Batch Studio running at http://0.0.0.0:${PORT}`);
+  const server = await new Promise<Server>((resolve, reject) => {
+    const srv = app.listen(port, host, () => resolve(srv));
+    srv.on('error', reject);
   });
+
+  const addr = server.address() as AddressInfo | null;
+  const boundPort = addr?.port ?? port;
+  console.log(`Douyin Batch Studio running at http://${host}:${boundPort}`);
+
+  return {
+    app,
+    server,
+    port: boundPort,
+    host,
+    close: () =>
+      new Promise<void>((resolve) => {
+        server.close(() => resolve());
+      }),
+  };
 }
 
-startServer().catch((err) => {
-  console.error('Failed to start server:', err);
-  process.exit(1);
-});
+if (process.env.DOUYIN_EMBEDDED_SERVER !== '1') {
+  createAndStartServer().catch((err) => {
+    console.error('Failed to start server:', err);
+    process.exit(1);
+  });
+}

@@ -12,8 +12,11 @@ __pycache__/
 htmlcov/
 
 # Build/package artifacts
-build/
 dist/
+dist-electron/
+release/
+node_modules/
+.playwright-cli/
 .eggs/
 *.egg-info/
 pip-wheel-metadata/

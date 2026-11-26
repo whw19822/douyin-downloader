@@ -3,10 +3,12 @@ import {
   Check,
   Copy,
   Download,
+  FolderOpen,
   RefreshCw,
   Save,
 } from 'lucide-react';
 import { getHotBoardApi } from '../lib/api';
+import { getDesktopBridge } from '../lib/desktop';
 import { generateConfigYaml } from '../lib/batchRules';
 import {
   ALLOWED_TEMPLATE_VARIABLES,
@@ -59,6 +61,7 @@ export function HotAndSettingsView({
   const [hotItems, setHotItems] = useState<HotBoardItem[]>([]);
   const [hotSource, setHotSource] = useState<'live' | 'snapshot'>('snapshot');
   const [loadingHot, setLoadingHot] = useState(true);
+  const desktop = useMemo(() => getDesktopBridge(), []);
 
   useEffect(() => {
     setDraft(settings);
@@ -180,12 +183,42 @@ export function HotAndSettingsView({
 
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
             <div className="space-y-1.5">
-              <label
-                htmlFor="download-path-input"
-                className="block text-xs font-medium text-slate-700 dark:text-slate-300"
-              >
-                默认保存目录
-              </label>
+              <div className="flex items-center justify-between gap-2">
+                <label
+                  htmlFor="download-path-input"
+                  className="block text-xs font-medium text-slate-700 dark:text-slate-300"
+                >
+                  默认保存目录
+                </label>
+                {desktop && (
+                  <div className="flex items-center gap-2 text-[11px]">
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        const chosen = await desktop.selectDownloadDirectory();
+                        if (chosen) {
+                          setDraft((prev) => ({ ...prev, downloadPath: chosen }));
+                          onNotify(`已选择本地保存目录：${chosen}`);
+                        }
+                      }}
+                      className="text-rose-600 hover:text-rose-700 dark:text-rose-400 font-medium"
+                    >
+                      选择目录
+                    </button>
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        const res = await desktop.openDownloadsFolder(draft.downloadPath);
+                        if (!res.ok) onNotify('打开下载目录失败');
+                      }}
+                      className="inline-flex items-center gap-1 text-slate-600 hover:text-slate-900 dark:text-slate-400 dark:hover:text-slate-200"
+                    >
+                      <FolderOpen className="w-3 h-3" aria-hidden="true" />
+                      访达打开
+                    </button>
+                  </div>
+                )}
+              </div>
               <input
                 id="download-path-input"
                 type="text"
