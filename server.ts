@@ -9,6 +9,10 @@ import { parseBatchInput } from './src/lib/urlParser';
 import { validateNamingTemplate } from './src/lib/naming';
 import { generateConfigYaml } from './src/lib/batchRules';
 import { fetchDouyinHotBoard, inspectAndResolveLinks } from './server/douyinService';
+import {
+  setCustomCdpSessionFactory,
+  type CdpSessionFactory,
+} from './server/douyinScraper';
 import { jobStore } from './server/jobStore';
 import { isAllowedMediaHost, streamFilesAsZip } from './server/mediaDownloader';
 import type { BatchSettings, DiscoveredWork } from './src/lib/types';
@@ -21,6 +25,7 @@ export interface ServerStartOptions {
   host?: string;
   distDir?: string;
   isProd?: boolean;
+  createCdpSession?: CdpSessionFactory;
 }
 
 export interface StartedServerHandle {
@@ -38,6 +43,10 @@ export async function createAndStartServer(
   const host = options.host ?? '0.0.0.0';
   const isProd = options.isProd ?? process.env.NODE_ENV === 'production';
   const distDir = options.distDir ?? path.join(__dirname, 'dist');
+
+  if (options.createCdpSession) {
+    setCustomCdpSessionFactory(options.createCdpSession);
+  }
 
   const app = express();
   app.use(cors());

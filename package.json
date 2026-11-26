@@ -16,7 +16,7 @@
     "dist:mac:dir": "npm run build:electron && electron-builder --mac --arm64 --dir --config electron-builder.yml",
     "lint": "eslint src server.ts server electron",
     "start": "NODE_ENV=production node server.ts",
-    "test": "tsx --test src/lib/*.test.ts"
+    "test": "tsx --test src/lib/*.test.ts server/*.test.ts"
   },
   "dependencies": {
     "@types/archiver": "^8.0.0",

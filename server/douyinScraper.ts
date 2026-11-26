@@ -23,7 +23,7 @@ import type {
 const MOBILE_UA =
   'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1';
 
-const DESKTOP_UA =
+export const DESKTOP_UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36';
 
 export interface CreatorProfileSummary {
@@ -39,6 +39,52 @@ export interface DiscoveryResult {
   profile?: CreatorProfileSummary;
   warnings: string[];
   requiresCookie?: boolean;
+}
+
+export function isHeadlessShellBinary(chromePath: string): boolean {
+  return /headless[-_]shell/i.test(path.basename(chromePath));
+}
+
+export function buildChromeLaunchArgs(
+  chromePath: string,
+  userDataDir: string,
+): string[] {
+  const args: string[] = [];
+
+  if (!isHeadlessShellBinary(chromePath)) {
+    // Full GUI Chrome / Chromium / Edge / Brave binaries on macOS/Linux/Windows
+    // MUST run in headless mode so they never open a visible window or hijack a tab.
+    args.push('--headless=new');
+  }
+
+  args.push(
+    // Always use an isolated temporary profile directory:
+    // 1. Prevents forwarding `about:blank` to an already-running Chrome instance (SingletonLock)
+    //    and exiting immediately with code 0.
+    // 2. Satisfies Chrome 136+'s requirement that --remote-debugging-port use a non-default
+    //    --user-data-dir.
+    `--user-data-dir=${userDataDir}`,
+    '--no-first-run',
+    '--no-default-browser-check',
+    '--use-mock-keychain',
+    '--password-store=basic',
+    '--no-sandbox',
+    '--disable-gpu',
+    '--disable-dev-shm-usage',
+    '--disable-extensions',
+    '--disable-sync',
+    '--disable-background-networking',
+    '--disable-component-update',
+    '--mute-audio',
+    '--disable-blink-features=AutomationControlled',
+    '--window-size=1440,900',
+    '--lang=zh-CN',
+    `--user-agent=${DESKTOP_UA}`,
+    '--remote-debugging-port=0',
+    'about:blank',
+  );
+
+  return args;
 }
 
 function findChromeBinary(): string | null {
@@ -58,6 +104,10 @@ function findChromeBinary(): string | null {
     '/usr/bin/chromium',
     '/usr/bin/chromium-browser',
     '/usr/bin/google-chrome',
+    // Windows standard Chrome / Edge paths
+    'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+    'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+    'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
   ].filter((p): p is string => Boolean(p));
 
   for (const candidate of candidates) {
@@ -203,79 +253,185 @@ export async function fetchSingleAwemeBySharePage(
   return null;
 }
 
-interface CdpSession {
+export interface CdpSession {
   send: (method: string, params?: Record<string, unknown>) => Promise<Record<string, unknown>>;
   onEvent: (handler: (method: string, params: Record<string, unknown>) => void) => void;
   close: () => void;
 }
 
-async function openCdpSession(): Promise<CdpSession> {
-  const chromePath = findChromeBinary();
-  if (!chromePath) {
-    throw new Error('容器内未找到 Chromium 浏览器二进制，无法启动页面抓取引擎');
+export type CdpSessionFactory = () => Promise<CdpSession>;
+
+let customCdpSessionFactory: CdpSessionFactory | null = null;
+
+export function setCustomCdpSessionFactory(factory: CdpSessionFactory | null): void {
+  customCdpSessionFactory = factory;
+}
+
+function readDevToolsActivePort(userDataDir: string): string | null {
+  const portFile = path.join(userDataDir, 'DevToolsActivePort');
+  try {
+    if (!fs.existsSync(portFile)) return null;
+    const lines = fs
+      .readFileSync(portFile, 'utf8')
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean);
+    const port = Number(lines[0]);
+    const wsPath = lines[1] || '/devtools/browser';
+    if (!Number.isFinite(port) || port <= 0) return null;
+    return `ws://127.0.0.1:${port}${wsPath.startsWith('/') ? wsPath : `/${wsPath}`}`;
+  } catch {
+    return null;
+  }
+}
+
+async function resolvePageTargetWsUrl(baseHttp: string): Promise<string> {
+  const deadline = Date.now() + 4_000;
+  while (Date.now() < deadline) {
+    try {
+      const res = await fetch(`${baseHttp}/json/list`);
+      if (res.ok) {
+        const targets = (await res.json()) as Array<{
+          type?: string;
+          webSocketDebuggerUrl?: string;
+        }>;
+        const pageTarget = targets.find((t) => t.type === 'page' && t.webSocketDebuggerUrl);
+        if (pageTarget?.webSocketDebuggerUrl) {
+          return pageTarget.webSocketDebuggerUrl;
+        }
+      }
+    } catch {
+      // retry until DevTools HTTP endpoint is ready
+    }
+    await new Promise((r) => setTimeout(r, 150));
   }
 
+  for (const method of ['PUT', 'GET'] as const) {
+    try {
+      const res = await fetch(`${baseHttp}/json/new?about:blank`, { method });
+      if (res.ok) {
+        const created = (await res.json()) as { webSocketDebuggerUrl?: string };
+        if (created.webSocketDebuggerUrl) {
+          return created.webSocketDebuggerUrl;
+        }
+      }
+    } catch {
+      // try fallback method
+    }
+  }
+
+  throw new Error('未能获取 Chromium 页面调试目标');
+}
+
+async function openExternalChromeCdpSession(): Promise<CdpSession> {
+  const chromePath = findChromeBinary();
+  if (!chromePath) {
+    throw new Error('未找到可用的 Chrome / Chromium 浏览器，无法启动页面抓取引擎');
+  }
+
+  const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'douyin-cdp-'));
   const proc: ChildProcess = spawn(
     chromePath,
-    [
-      '--no-sandbox',
-      '--disable-gpu',
-      '--disable-dev-shm-usage',
-      '--disable-blink-features=AutomationControlled',
-      '--window-size=1440,900',
-      '--lang=zh-CN',
-      `--user-agent=${DESKTOP_UA}`,
-      '--remote-debugging-port=0',
-      'about:blank',
-    ],
+    buildChromeLaunchArgs(chromePath, userDataDir),
     { stdio: ['ignore', 'pipe', 'pipe'] },
   );
 
   let ws: WebSocket | null = null;
+  let cleanedUp = false;
+
+  const removeUserDataDir = () => {
+    try {
+      fs.rmSync(userDataDir, { recursive: true, force: true });
+    } catch {
+      // ignore temp profile cleanup errors
+    }
+  };
+
+  proc.once('exit', () => {
+    const timer = setTimeout(removeUserDataDir, 250);
+    timer.unref?.();
+  });
+
   const cleanup = () => {
+    if (cleanedUp) return;
+    cleanedUp = true;
     try {
       ws?.close();
     } catch {
       // ignore
     }
     try {
-      proc.kill('SIGKILL');
+      if (proc.exitCode === null && !proc.killed) {
+        proc.kill('SIGKILL');
+      }
     } catch {
       // ignore
     }
+    const timer = setTimeout(removeUserDataDir, 400);
+    timer.unref?.();
   };
 
   try {
     const wsBrowserUrl = await new Promise<string>((resolve, reject) => {
       let stderrBuf = '';
-      const timer = setTimeout(() => reject(new Error('Chromium 启动超时')), 10_000);
+      let settled = false;
+
+      const finish = (err: Error | null, url?: string) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        clearInterval(portPoller);
+        if (err) reject(err);
+        else resolve(url!);
+      };
+
+      const timer = setTimeout(
+        () => finish(new Error('Chromium 启动超时')),
+        15_000,
+      );
+
+      const portPoller = setInterval(() => {
+        const activePortUrl = readDevToolsActivePort(userDataDir);
+        if (activePortUrl) {
+          finish(null, activePortUrl);
+        }
+      }, 200);
+
       proc.stderr?.on('data', (chunk: Buffer) => {
         stderrBuf += chunk.toString();
         const match = stderrBuf.match(/DevTools listening on (ws:\/\/[^\s]+)/);
         if (match) {
-          clearTimeout(timer);
-          resolve(match[1]);
+          finish(null, match[1]);
         }
       });
+
+      proc.on('error', (err) => {
+        finish(new Error(`Chromium 启动失败: ${err.message}`));
+      });
+
       proc.on('exit', (code) => {
-        clearTimeout(timer);
-        reject(new Error(`Chromium 异常退出 (code=${code})`));
+        const tail = stderrBuf
+          .split(/\r?\n/)
+          .map((line) => line.trim())
+          .filter(Boolean)
+          .slice(-3)
+          .join(' | ');
+        finish(
+          new Error(
+            tail
+              ? `Chromium 异常退出 (code=${code}): ${tail}`
+              : `Chromium 异常退出 (code=${code})`,
+          ),
+        );
       });
     });
 
     const baseHttp = wsBrowserUrl
       .replace(/^ws:\/\//, 'http://')
-      .replace(/\/devtools\/browser\/.*$/, '');
-    const targets = (await (await fetch(`${baseHttp}/json`)).json()) as Array<{
-      type?: string;
-      webSocketDebuggerUrl?: string;
-    }>;
-    const pageTarget = targets.find((t) => t.type === 'page' && t.webSocketDebuggerUrl);
-    if (!pageTarget?.webSocketDebuggerUrl) {
-      throw new Error('未能获取 Chromium 页面调试目标');
-    }
+      .replace(/\/devtools\/browser.*$/, '');
+    const pageWsUrl = await resolvePageTargetWsUrl(baseHttp);
 
-    ws = new WebSocket(pageTarget.webSocketDebuggerUrl);
+    ws = new WebSocket(pageWsUrl);
     let msgId = 1;
     const pending = new Map<
       number,
@@ -350,6 +506,20 @@ async function openCdpSession(): Promise<CdpSession> {
   }
 }
 
+async function openCdpSession(): Promise<CdpSession> {
+  if (customCdpSessionFactory) {
+    try {
+      return await customCdpSessionFactory();
+    } catch (err) {
+      console.warn(
+        '[douyinScraper] 内置 Chromium 会话初始化失败，回退至系统无头 Chrome:',
+        err instanceof Error ? err.message : err,
+      );
+    }
+  }
+  return openExternalChromeCdpSession();
+}
+
 interface ScrapeOptions {
   quality: VideoQuality;
   cookieString?: string;
@@ -399,12 +569,33 @@ async function scrapePageViaChromium(
 
     const parsedCookies = parseCookieString(options.cookieString || '');
     if (parsedCookies.length > 0) {
-      await session.send('Network.setCookies', {
-        cookies: parsedCookies.flatMap((c) => [
-          { ...c, domain: '.douyin.com' },
-          { ...c, domain: '.iesdouyin.com' },
-        ]),
+      const cdpCookies: Array<Record<string, unknown>> = parsedCookies.flatMap<
+        Record<string, unknown>
+      >((c) => {
+        if (c.name.startsWith('__Host-')) {
+          return [
+            {
+              name: c.name,
+              value: c.value,
+              url: 'https://www.douyin.com',
+              path: '/',
+              secure: true,
+            },
+          ];
+        }
+        const secure = c.name.startsWith('__Secure-') ? true : undefined;
+        return [
+          { ...c, domain: '.douyin.com', ...(secure ? { secure } : {}) },
+          { ...c, domain: '.iesdouyin.com', ...(secure ? { secure } : {}) },
+        ];
       });
+      try {
+        await session.send('Network.setCookies', { cookies: cdpCookies });
+      } catch {
+        for (const cookie of cdpCookies) {
+          await session.send('Network.setCookie', cookie).catch(() => undefined);
+        }
+      }
     }
 
     const handleJsonResponse = (apiUrl: string, text: string) => {
