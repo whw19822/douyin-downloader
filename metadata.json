@@ -1,0 +1,5 @@
+{
+  "name": "抖存批量工作台 · Douyin Batch Studio",
+  "description": "免内测码开源抖音批量下载工作台，支持多链接批量解析、创作者主页/合集/图文并发队列、增量去重、命名模板与 YAML 配置导出。",
+  "requestFramePermissions": []
+}
