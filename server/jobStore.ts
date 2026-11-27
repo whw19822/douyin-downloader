@@ -590,7 +590,7 @@ export class BatchJobStore {
         mode: work.mode,
       });
 
-      if (skip && existingDiskFiles.length > 0) {
+      if (skip && hasFileOnDisk && existingDiskFiles.length > 0) {
         this.itemDiskFiles.set(`${jobId}:${jobId}-${idx + 1}`, existingDiskFiles);
       }
 
@@ -612,7 +612,11 @@ export class BatchJobStore {
         status: skip ? 'skipped' : 'pending',
         progress: skip ? 100 : 0,
         retries: 0,
-        message: skip ? '增量去重命中，本地文件已完整存在' : '等待并发队列下载媒体文件',
+        message: skip
+          ? hasFileOnDisk
+            ? '增量去重命中，本地文件已完整存在'
+            : '增量去重命中，已存档案自动跳过（本地文件缺失）'
+          : '等待并发队列下载媒体文件',
         upstreamStatus: 'live',
         mediaUrl: work.videoUrl,
         imageUrls: work.imageUrls,
@@ -620,14 +624,15 @@ export class BatchJobStore {
         musicUrl: work.musicUrl,
         avatarUrl: work.avatarUrl,
         artifacts: buildArtifactLabels(work, merged),
-        savedFiles: skip
-          ? existingDiskFiles.map((f) => ({
-              kind: f.kind,
-              filename: f.filename,
-              relativePath: f.relativePath,
-              sizeBytes: f.sizeBytes,
-            }))
-          : [],
+        savedFiles:
+          skip && hasFileOnDisk
+            ? existingDiskFiles.map((f) => ({
+                kind: f.kind,
+                filename: f.filename,
+                relativePath: f.relativePath,
+                sizeBytes: f.sizeBytes,
+              }))
+            : [],
         downloadReady: skip && hasFileOnDisk,
         updatedAt: now,
       };

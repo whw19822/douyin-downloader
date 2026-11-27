@@ -185,16 +185,12 @@ export function buildAuthorFolderName(
   return safeName;
 }
 
-export async function downloadAwemeMediaToDisk(
-  media: ParsedAwemeMedia,
+export function resolveMediaOutputLocation(
+  media: Pick<ParsedAwemeMedia, 'awemeId' | 'author' | 'authorId'>,
   baseFilename: string,
   folderName: string,
-  settings: BatchSettings,
-  options: {
-    onProgress?: (percent: number, message: string) => void;
-    signal?: AbortSignal;
-  } = {},
-): Promise<MediaDownloadResult> {
+  settings: Pick<BatchSettings, 'downloadPath' | 'authorDir' | 'folderStyle'>,
+): { rootDir: string; authorFolder: string; itemDir: string; safeStem: string } {
   const rootDir = resolveSafeDownloadRoot(settings.downloadPath);
   const authorFolder = buildAuthorFolderName(
     media.author,
@@ -205,8 +201,36 @@ export async function downloadAwemeMediaToDisk(
     ? path.join(rootDir, authorFolder, sanitizeFilename(folderName, 80))
     : path.join(rootDir, authorFolder);
 
+  let safeStem = sanitizeFilename(baseFilename, 80);
+  // When flattening all works directly into the author folder, ensure awemeId stays
+  // in the filename stem so works with identical long titles never overwrite each other.
+  if (!settings.folderStyle && media.awemeId && !safeStem.includes(media.awemeId)) {
+    const suffix = `_${sanitizeFilename(media.awemeId, 32)}`;
+    const maxPrefixLen = Math.max(1, 80 - suffix.length);
+    safeStem = `${safeStem.slice(0, maxPrefixLen).replace(/[. ]+$/g, '')}${suffix}`;
+  }
+
+  return { rootDir, authorFolder, itemDir, safeStem };
+}
+
+export async function downloadAwemeMediaToDisk(
+  media: ParsedAwemeMedia,
+  baseFilename: string,
+  folderName: string,
+  settings: BatchSettings,
+  options: {
+    onProgress?: (percent: number, message: string) => void;
+    signal?: AbortSignal;
+  } = {},
+): Promise<MediaDownloadResult> {
+  const { rootDir, itemDir, safeStem } = resolveMediaOutputLocation(
+    media,
+    baseFilename,
+    folderName,
+    settings,
+  );
+
   await fsp.mkdir(itemDir, { recursive: true });
-  const safeStem = sanitizeFilename(baseFilename, 80);
   const files: DownloadedFileRecord[] = [];
   let totalBytes = 0;
 

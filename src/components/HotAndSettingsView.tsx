@@ -309,30 +309,44 @@ export function HotAndSettingsView({
             </div>
           </div>
 
-          <div className="space-y-1.5">
-            <label
-              htmlFor="folder-template-input"
-              className="block text-xs font-medium text-slate-700 dark:text-slate-300"
-            >
-              作品子目录模板
+          <div className="space-y-2">
+            <label className="flex items-center justify-between gap-3 cursor-pointer">
+              <span className="text-xs font-medium text-slate-700 dark:text-slate-300">
+                每个作品单独建文件夹（关闭则所有作品平铺在作者文件夹内）
+              </span>
+              <input
+                type="checkbox"
+                checked={draft.folderStyle}
+                onChange={(e) => setDraft({ ...draft, folderStyle: e.target.checked })}
+                className="w-4 h-4 rounded accent-rose-600 shrink-0"
+              />
             </label>
-            <input
-              id="folder-template-input"
-              type="text"
-              value={draft.folderTemplate}
-              onChange={(e) => setDraft({ ...draft, folderTemplate: e.target.value })}
-              aria-invalid={!folderTplValidation.valid}
-              className={`w-full rounded-lg border px-3 py-2 text-xs font-mono bg-white dark:bg-[#0B0F17] text-slate-900 dark:text-slate-100 focus:outline-none ${
-                folderTplValidation.valid
-                  ? 'border-slate-200 dark:border-slate-700 focus:border-rose-500'
-                  : 'border-red-500 focus:border-red-600'
-              }`}
-            />
-            {!folderTplValidation.valid && (
-              <p role="alert" className="text-xs text-red-600 dark:text-red-400">
-                {folderTplValidation.error}
-              </p>
-            )}
+            <div className="space-y-1.5">
+              <label
+                htmlFor="folder-template-input"
+                className="block text-xs font-medium text-slate-700 dark:text-slate-300"
+              >
+                作品子目录模板{draft.folderStyle ? '' : '（当前平铺模式未启用）'}
+              </label>
+              <input
+                id="folder-template-input"
+                type="text"
+                disabled={!draft.folderStyle}
+                value={draft.folderTemplate}
+                onChange={(e) => setDraft({ ...draft, folderTemplate: e.target.value })}
+                aria-invalid={!folderTplValidation.valid}
+                className={`w-full rounded-lg border px-3 py-2 text-xs font-mono bg-white dark:bg-[#0B0F17] text-slate-900 dark:text-slate-100 focus:outline-none disabled:opacity-50 ${
+                  folderTplValidation.valid
+                    ? 'border-slate-200 dark:border-slate-700 focus:border-rose-500'
+                    : 'border-red-500 focus:border-red-600'
+                }`}
+              />
+              {!folderTplValidation.valid && (
+                <p role="alert" className="text-xs text-red-600 dark:text-red-400">
+                  {folderTplValidation.error}
+                </p>
+              )}
+            </div>
           </div>
 
           <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 border-t border-slate-200 dark:border-slate-800 pt-4">

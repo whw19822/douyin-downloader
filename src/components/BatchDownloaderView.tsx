@@ -738,33 +738,61 @@ export function BatchDownloaderView({
           <div className="border-t border-slate-200 dark:border-slate-800 pt-4 space-y-2.5">
             <label className="flex items-center justify-between gap-3 cursor-pointer">
               <span className="text-xs text-slate-700 dark:text-slate-300">
-                启用增量下载（自动跳过本地已完整下载的作品）
+                启用增量下载（自动跳过本地已完整下载的作品，文件缺失时重下）
               </span>
               <input
                 type="checkbox"
-                checked={settings.incremental}
+                checked={settings.incremental && settings.redownloadMissingFiles}
                 onChange={(e) =>
-                  onChangeSettings({ ...settings, incremental: e.target.checked })
+                  onChangeSettings(
+                    e.target.checked
+                      ? { ...settings, incremental: true, redownloadMissingFiles: true }
+                      : { ...settings, incremental: false },
+                  )
                 }
-                className="w-4 h-4 rounded accent-rose-600"
+                className="w-4 h-4 rounded accent-rose-600 shrink-0"
               />
             </label>
             <label className="flex items-center justify-between gap-3 cursor-pointer">
               <span className="text-xs text-slate-700 dark:text-slate-300">
-                磁盘主文件缺失时自动重新下载
+                启用增量下载（自动跳过已存档案，即使文件缺失）
               </span>
               <input
                 type="checkbox"
-                checked={settings.redownloadMissingFiles}
+                checked={settings.incremental && !settings.redownloadMissingFiles}
                 onChange={(e) =>
-                  onChangeSettings({
-                    ...settings,
-                    redownloadMissingFiles: e.target.checked,
-                  })
+                  onChangeSettings(
+                    e.target.checked
+                      ? { ...settings, incremental: true, redownloadMissingFiles: false }
+                      : { ...settings, incremental: false },
+                  )
                 }
-                className="w-4 h-4 rounded accent-rose-600"
+                className="w-4 h-4 rounded accent-rose-600 shrink-0"
               />
             </label>
+            <div className="pt-1 border-t border-slate-100 dark:border-slate-800/70 space-y-1">
+              <label className="flex items-center justify-between gap-3 cursor-pointer">
+                <span className="text-xs text-slate-700 dark:text-slate-300">
+                  每个作品单独建文件夹（关闭则所有作品文件平铺在作者文件夹内）
+                </span>
+                <input
+                  type="checkbox"
+                  checked={settings.folderStyle}
+                  onChange={(e) =>
+                    onChangeSettings({
+                      ...settings,
+                      folderStyle: e.target.checked,
+                    })
+                  }
+                  className="w-4 h-4 rounded accent-rose-600 shrink-0"
+                />
+              </label>
+              <p className="text-[11px] font-mono text-slate-500 dark:text-slate-400">
+                {settings.folderStyle
+                  ? '当前落盘结构：作者文件夹 / 作品独立子文件夹 / 视频与附件'
+                  : '当前落盘结构：作者文件夹 / 该博主全部作品文件直接平铺'}
+              </p>
+            </div>
           </div>
 
           <div className="border-t border-slate-200 dark:border-slate-800 pt-4 space-y-2">
