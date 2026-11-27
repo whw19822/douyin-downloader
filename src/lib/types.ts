@@ -184,6 +184,16 @@ export interface HotBoardItem {
   category: string;
 }
 
+export interface UiPreferences {
+  theme: 'light' | 'dark';
+  draftInput: string;
+}
+
+export const DEFAULT_UI_PREFERENCES: UiPreferences = {
+  theme: 'light',
+  draftInput: '',
+};
+
 export const DEFAULT_BATCH_SETTINGS: BatchSettings = {
   downloadPath: './Downloaded/',
   modes: ['post'],

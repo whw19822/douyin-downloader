@@ -5,6 +5,7 @@ export interface DesktopBridge {
     isDesktop: boolean;
     platform: string;
     downloadDir: string;
+    dataDir?: string;
     appVersion: string;
   }>;
   openDownloadsFolder: (

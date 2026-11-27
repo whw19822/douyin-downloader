@@ -197,8 +197,20 @@ export function HotAndSettingsView({
                       onClick={async () => {
                         const chosen = await desktop.selectDownloadDirectory();
                         if (chosen) {
-                          setDraft((prev) => ({ ...prev, downloadPath: chosen }));
-                          onNotify(`已选择本地保存目录：${chosen}`);
+                          const nextDraft = { ...draft, downloadPath: chosen };
+                          setDraft(nextDraft);
+                          if (canSave) {
+                            try {
+                              await onSaveSettings(nextDraft);
+                              onNotify(`已选择并保存本地保存目录：${chosen}`);
+                            } catch (err) {
+                              onNotify(
+                                err instanceof Error ? err.message : '保存目录失败，请点击保存配置重试',
+                              );
+                            }
+                          } else {
+                            onNotify(`已选择本地保存目录：${chosen}（请修正命名模板后点击保存）`);
+                          }
                         }
                       }}
                       className="text-rose-600 hover:text-rose-700 dark:text-rose-400 font-medium"

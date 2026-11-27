@@ -16,6 +16,7 @@ files:
   - "!**/node_modules/*/{test,__tests__,tests,powered-test,example,examples}"
   - "!**/node_modules/.bin"
   - "!.playwright-cli/**"
+  - "!.douyin-studio-data/**"
   - "!Downloaded/**"
   - "!release/**"
 

@@ -21,6 +21,7 @@ interface CdpSession {
 interface EmbeddedServerHandle {
   port: number;
   host: string;
+  dataDir?: string;
   close: () => Promise<void>;
 }
 
@@ -29,12 +30,14 @@ interface EmbeddedServerModule {
     port?: number;
     host?: string;
     distDir?: string;
+    dataDir?: string;
     isProd?: boolean;
     createCdpSession?: () => Promise<CdpSession>;
   }) => Promise<EmbeddedServerHandle>;
 }
 
 const APP_NAME = '抖存批量工作台';
+const PREFERRED_LOCAL_PORT = 47831;
 const SCRAPER_DESKTOP_UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36';
 
@@ -42,6 +45,16 @@ let mainWindow: BrowserWindow | null = null;
 let serverHandle: EmbeddedServerHandle | null = null;
 let appUrl: string | null = null;
 const activeScrapeClosers = new Set<() => void>();
+
+function getAppDataDir(): string {
+  const dir = path.join(app.getPath('userData'), 'data');
+  try {
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  } catch {
+    // ignore mkdir errors until first write
+  }
+  return dir;
+}
 
 function getDefaultDownloadDir(): string {
   const dir = path.join(app.getPath('downloads'), 'DouyinBatchStudio');
@@ -51,6 +64,30 @@ function getDefaultDownloadDir(): string {
     // ignore mkdir errors until first download
   }
   return dir;
+}
+
+function getEffectiveDownloadDir(): string {
+  const fallback = getDefaultDownloadDir();
+  try {
+    const settingsPath = path.join(getAppDataDir(), 'settings.json');
+    if (fs.existsSync(settingsPath)) {
+      const parsed = JSON.parse(fs.readFileSync(settingsPath, 'utf8')) as {
+        settings?: { downloadPath?: string };
+      };
+      const configured = parsed?.settings?.downloadPath?.trim();
+      if (
+        configured &&
+        path.isAbsolute(configured) &&
+        !configured.includes('..')
+      ) {
+        fs.mkdirSync(configured, { recursive: true });
+        return configured;
+      }
+    }
+  } catch {
+    // fall back to default downloads directory
+  }
+  return fallback;
 }
 
 function buildAppMenu(): void {
@@ -67,7 +104,7 @@ function buildAppMenu(): void {
                 label: '在访达中打开下载目录',
                 accelerator: 'CmdOrCtrl+Shift+O',
                 click: () => {
-                  void shell.openPath(getDefaultDownloadDir());
+                  void shell.openPath(getEffectiveDownloadDir());
                 },
               },
               { type: 'separator' as const },
@@ -240,9 +277,11 @@ async function startEmbeddedBackend(): Promise<string> {
   }
 
   const downloadDir = getDefaultDownloadDir();
+  const dataDir = getAppDataDir();
   process.env.DOUYIN_EMBEDDED_SERVER = '1';
   process.env.DOUYIN_DESKTOP = '1';
   process.env.DOUYIN_DOWNLOAD_BASE_DIR = downloadDir;
+  process.env.DOUYIN_DATA_DIR = dataDir;
 
   const appRoot = app.getAppPath();
   const serverEntryPath = path.join(appRoot, 'dist-electron', 'server.mjs');
@@ -252,13 +291,30 @@ async function startEmbeddedBackend(): Promise<string> {
     pathToFileURL(serverEntryPath).href
   )) as EmbeddedServerModule;
 
-  serverHandle = await mod.createAndStartServer({
-    port: 0,
+  const baseOptions = {
     host: '127.0.0.1',
     distDir,
+    dataDir,
     isProd: true,
     createCdpSession: createElectronCdpSession,
-  });
+  };
+
+  try {
+    serverHandle = await mod.createAndStartServer({
+      ...baseOptions,
+      port: PREFERRED_LOCAL_PORT,
+    });
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException | undefined)?.code;
+    if (code === 'EADDRINUSE' || code === 'EACCES') {
+      serverHandle = await mod.createAndStartServer({
+        ...baseOptions,
+        port: 0,
+      });
+    } else {
+      throw err;
+    }
+  }
 
   return `http://${serverHandle.host}:${serverHandle.port}`;
 }
@@ -267,12 +323,13 @@ function registerIpcHandlers(): void {
   ipcMain.handle('desktop:get-info', () => ({
     isDesktop: true,
     platform: process.platform,
-    downloadDir: getDefaultDownloadDir(),
+    downloadDir: getEffectiveDownloadDir(),
+    dataDir: getAppDataDir(),
     appVersion: app.getVersion(),
   }));
 
   ipcMain.handle('desktop:open-downloads', async (_event, customPath?: string) => {
-    const fallback = getDefaultDownloadDir();
+    const fallback = getEffectiveDownloadDir();
     const target =
       typeof customPath === 'string' &&
       path.isAbsolute(customPath) &&
@@ -289,7 +346,7 @@ function registerIpcHandlers(): void {
   ipcMain.handle('desktop:select-directory', async () => {
     const result = await dialog.showOpenDialog({
       title: '选择抖音媒体默认保存目录',
-      defaultPath: getDefaultDownloadDir(),
+      defaultPath: getEffectiveDownloadDir(),
       properties: ['openDirectory', 'createDirectory'],
     });
     if (result.canceled || result.filePaths.length === 0) {
@@ -332,7 +389,7 @@ function createMainWindow(targetUrl: string): BrowserWindow {
   win.webContents.session.on('will-download', (_event, item) => {
     const filename = item.getFilename();
     if (filename) {
-      const targetDir = getDefaultDownloadDir();
+      const targetDir = getEffectiveDownloadDir();
       fs.mkdirSync(targetDir, { recursive: true });
       item.setSavePath(path.join(targetDir, filename));
     }

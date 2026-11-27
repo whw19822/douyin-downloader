@@ -1,15 +1,17 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Menu, X } from 'lucide-react';
 import {
   cancelJobApi,
   createBatchJobApi,
   deleteArchiveItemApi,
   deleteJobApi,
+  getPreferencesApi,
   getSettingsApi,
   listArchiveApi,
   listJobsApi,
   retryJobApi,
   toggleArchiveFileApi,
+  updatePreferencesApi,
   updateSettingsApi,
 } from './lib/api';
 import { generateConfigYaml } from './lib/batchRules';
@@ -52,9 +54,69 @@ export function App() {
   const [submitting, setSubmitting] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
 
+  const settingsSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pendingSettingsRef = useRef<BatchSettings | null>(null);
+  const draftSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pendingDraftRef = useRef<string | null>(null);
+
   const showNotice = useCallback((msg: string) => {
     setNotice(msg);
   }, []);
+
+  const flushPendingPersistence = useCallback(() => {
+    if (settingsSaveTimerRef.current) {
+      clearTimeout(settingsSaveTimerRef.current);
+      settingsSaveTimerRef.current = null;
+    }
+    if (pendingSettingsRef.current) {
+      const payload = pendingSettingsRef.current;
+      pendingSettingsRef.current = null;
+      const blob = new Blob([JSON.stringify(payload)], { type: 'application/json' });
+      if (typeof navigator !== 'undefined' && typeof navigator.sendBeacon === 'function') {
+        navigator.sendBeacon('/api/settings', blob);
+      } else {
+        void fetch('/api/settings', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+          keepalive: true,
+        }).catch(() => undefined);
+      }
+    }
+
+    if (draftSaveTimerRef.current) {
+      clearTimeout(draftSaveTimerRef.current);
+      draftSaveTimerRef.current = null;
+    }
+    if (pendingDraftRef.current !== null) {
+      const draftInput = pendingDraftRef.current;
+      pendingDraftRef.current = null;
+      const blob = new Blob([JSON.stringify({ draftInput })], {
+        type: 'application/json',
+      });
+      if (typeof navigator !== 'undefined' && typeof navigator.sendBeacon === 'function') {
+        navigator.sendBeacon('/api/preferences', blob);
+      } else {
+        void fetch('/api/preferences', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ draftInput }),
+          keepalive: true,
+        }).catch(() => undefined);
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    const onUnload = () => flushPendingPersistence();
+    window.addEventListener('beforeunload', onUnload);
+    window.addEventListener('pagehide', onUnload);
+    return () => {
+      window.removeEventListener('beforeunload', onUnload);
+      window.removeEventListener('pagehide', onUnload);
+      flushPendingPersistence();
+    };
+  }, [flushPendingPersistence]);
 
   useEffect(() => {
     if (!notice) return;
@@ -86,15 +148,22 @@ export function App() {
     let active = true;
     (async () => {
       try {
-        const [settingsRes, jobsRes, archiveRes] = await Promise.all([
+        const [settingsRes, jobsRes, archiveRes, prefsRes] = await Promise.all([
           getSettingsApi(),
           listJobsApi(),
           listArchiveApi(),
+          getPreferencesApi().catch(() => null),
         ]);
         if (!active) return;
         setSettings(settingsRes.settings);
         setJobs(jobsRes.jobs);
         setArchive(archiveRes.items);
+        if (prefsRes?.preferences) {
+          setDarkMode(prefsRes.preferences.theme === 'dark');
+          if (prefsRes.preferences.draftInput) {
+            setRawInput((prev) => (prev ? prev : prefsRes.preferences.draftInput));
+          }
+        }
       } catch (err) {
         if (active) {
           showNotice(err instanceof Error ? err.message : '初始化数据加载失败');
@@ -130,6 +199,11 @@ export function App() {
     urls?: string[];
     works?: import('./lib/types').DiscoveredWork[];
   }) => {
+    if (settingsSaveTimerRef.current) {
+      clearTimeout(settingsSaveTimerRef.current);
+      settingsSaveTimerRef.current = null;
+    }
+    pendingSettingsRef.current = null;
     setSubmitting(true);
     try {
       const { job } = await createBatchJobApi(payload, settings);
@@ -204,9 +278,52 @@ export function App() {
   };
 
   const handleSaveSettings = async (next: BatchSettings) => {
+    if (settingsSaveTimerRef.current) {
+      clearTimeout(settingsSaveTimerRef.current);
+      settingsSaveTimerRef.current = null;
+    }
+    pendingSettingsRef.current = null;
     const res = await updateSettingsApi(next);
     setSettings(res.settings);
   };
+
+  const handleInlineSettingsChange = useCallback((next: BatchSettings) => {
+    setSettings(next);
+    pendingSettingsRef.current = next;
+    if (settingsSaveTimerRef.current) {
+      clearTimeout(settingsSaveTimerRef.current);
+    }
+    settingsSaveTimerRef.current = setTimeout(() => {
+      const toPersist = pendingSettingsRef.current;
+      settingsSaveTimerRef.current = null;
+      pendingSettingsRef.current = null;
+      if (!toPersist) return;
+      void updateSettingsApi(toPersist).catch(() => undefined);
+    }, 350);
+  }, []);
+
+  const handleRawInputChange = useCallback((nextValue: string) => {
+    setRawInput(nextValue);
+    pendingDraftRef.current = nextValue;
+    if (draftSaveTimerRef.current) {
+      clearTimeout(draftSaveTimerRef.current);
+    }
+    draftSaveTimerRef.current = setTimeout(() => {
+      const toPersist = pendingDraftRef.current;
+      draftSaveTimerRef.current = null;
+      pendingDraftRef.current = null;
+      if (toPersist === null) return;
+      void updatePreferencesApi({ draftInput: toPersist }).catch(() => undefined);
+    }, 500);
+  }, []);
+
+  const handleToggleTheme = useCallback(() => {
+    setDarkMode((prev) => {
+      const next = !prev;
+      void updatePreferencesApi({ theme: next ? 'dark' : 'light' }).catch(() => undefined);
+      return next;
+    });
+  }, []);
 
   const activeSupportedUrls = useMemo(
     () =>
@@ -237,7 +354,7 @@ export function App() {
         totalJobCount={jobs.length}
         archiveCount={archive.length}
         darkMode={darkMode}
-        onToggleTheme={() => setDarkMode((prev) => !prev)}
+        onToggleTheme={handleToggleTheme}
         mobileOpen={mobileMenuOpen}
         onCloseMobile={() => setMobileMenuOpen(false)}
       />
@@ -299,9 +416,9 @@ export function App() {
           {activeTab === 'batch' && (
             <BatchDownloaderView
               rawInput={rawInput}
-              onChangeRawInput={setRawInput}
+              onChangeRawInput={handleRawInputChange}
               settings={settings}
-              onChangeSettings={setSettings}
+              onChangeSettings={handleInlineSettingsChange}
               onSubmitBatch={handleSubmitBatch}
               submitting={submitting}
               onNotify={showNotice}
@@ -327,7 +444,8 @@ export function App() {
               onDeleteItem={handleDeleteArchive}
               onToggleFilePresent={handleToggleArchiveFile}
               onRedownloadUrl={(url) => {
-                setRawInput((prev) => (prev.trim() ? `${prev.trim()}\n${url}` : url));
+                const next = rawInput.trim() ? `${rawInput.trim()}\n${url}` : url;
+                handleRawInputChange(next);
                 setActiveTab('batch');
                 showNotice('已将作品链接回填至批量下载输入框');
               }}

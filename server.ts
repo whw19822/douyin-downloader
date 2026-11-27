@@ -15,7 +15,11 @@ import {
 } from './server/douyinScraper';
 import { jobStore } from './server/jobStore';
 import { isAllowedMediaHost, streamFilesAsZip } from './server/mediaDownloader';
-import type { BatchSettings, DiscoveredWork } from './src/lib/types';
+import type {
+  BatchSettings,
+  DiscoveredWork,
+  UiPreferences,
+} from './src/lib/types';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -24,6 +28,7 @@ export interface ServerStartOptions {
   port?: number;
   host?: string;
   distDir?: string;
+  dataDir?: string;
   isProd?: boolean;
   createCdpSession?: CdpSessionFactory;
 }
@@ -33,6 +38,7 @@ export interface StartedServerHandle {
   server: Server;
   port: number;
   host: string;
+  dataDir: string;
   close: () => Promise<void>;
 }
 
@@ -43,6 +49,7 @@ export async function createAndStartServer(
   const host = options.host ?? '0.0.0.0';
   const isProd = options.isProd ?? process.env.NODE_ENV === 'production';
   const distDir = options.distDir ?? path.join(__dirname, 'dist');
+  const dataDir = jobStore.configurePersistence(options.dataDir);
 
   if (options.createCdpSession) {
     setCustomCdpSessionFactory(options.createCdpSession);
@@ -82,6 +89,8 @@ export async function createAndStartServer(
   });
 
   app.post('/api/discover', async (req, res) => {
+    req.setTimeout(10 * 60_000);
+    res.setTimeout(10 * 60_000);
     try {
       const rawText = typeof req.body?.rawText === 'string' ? req.body.rawText : '';
       if (!rawText.trim()) {
@@ -89,8 +98,17 @@ export async function createAndStartServer(
         return;
       }
       const settings = (req.body?.settings || {}) as Partial<BatchSettings>;
-      if (settings.cookieString !== undefined) {
-        jobStore.updateSettings({ cookieString: settings.cookieString });
+      if (settings.filenameTemplate !== undefined) {
+        const check = validateNamingTemplate(settings.filenameTemplate);
+        if (!check.valid) {
+          delete settings.filenameTemplate;
+        }
+      }
+      if (settings.folderTemplate !== undefined) {
+        const check = validateNamingTemplate(settings.folderTemplate);
+        if (!check.valid) {
+          delete settings.folderTemplate;
+        }
       }
       const result = await jobStore.discoverFromText(rawText, settings);
       res.json(result);
@@ -115,6 +133,8 @@ export async function createAndStartServer(
   });
 
   app.post('/api/jobs', async (req, res) => {
+    req.setTimeout(10 * 60_000);
+    res.setTimeout(10 * 60_000);
     try {
       const urls = Array.isArray(req.body?.urls)
         ? req.body.urls.filter(
@@ -338,7 +358,7 @@ export async function createAndStartServer(
     });
   });
 
-  app.put('/api/settings', (req, res) => {
+  const handleUpdateSettings: express.RequestHandler = (req, res) => {
     const body = (req.body || {}) as Partial<BatchSettings>;
     if (body.filenameTemplate !== undefined) {
       const check = validateNamingTemplate(body.filenameTemplate);
@@ -359,6 +379,25 @@ export async function createAndStartServer(
       settings: updated,
       yaml: generateConfigYaml([], updated),
     });
+  };
+
+  app.put('/api/settings', handleUpdateSettings);
+  app.post('/api/settings', handleUpdateSettings);
+
+  app.get('/api/preferences', (_req, res) => {
+    res.json({ preferences: jobStore.getPreferences() });
+  });
+
+  app.put('/api/preferences', (req, res) => {
+    const body = (req.body || {}) as Partial<UiPreferences>;
+    const updated = jobStore.updatePreferences(body);
+    res.json({ preferences: updated });
+  });
+
+  app.post('/api/preferences', (req, res) => {
+    const body = (req.body || {}) as Partial<UiPreferences>;
+    const updated = jobStore.updatePreferences(body);
+    res.json({ preferences: updated });
   });
 
   app.get('/api/hot-board', async (req, res) => {
@@ -396,8 +435,10 @@ export async function createAndStartServer(
     server,
     port: boundPort,
     host,
+    dataDir,
     close: () =>
       new Promise<void>((resolve) => {
+        jobStore.flush();
         server.close(() => resolve());
       }),
   };

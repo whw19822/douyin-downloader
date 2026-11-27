@@ -10,12 +10,15 @@ import { renderNamingTemplate } from '../src/lib/naming';
 import { parseBatchInput, resolveParsedLinks } from '../src/lib/urlParser';
 import {
   DEFAULT_BATCH_SETTINGS,
+  DEFAULT_UI_PREFERENCES,
   type ArchiveItem,
   type BatchJob,
   type BatchSettings,
   type DiscoveredWork,
+  type DownloadMode,
   type JobItem,
   type ParsedLink,
+  type UiPreferences,
 } from '../src/lib/types';
 import {
   discoverWorksForLink,
@@ -25,6 +28,92 @@ import {
   downloadAwemeMediaToDisk,
   type DownloadedFileRecord,
 } from './mediaDownloader';
+import { PersistenceStore, resolveDefaultDataDir } from './persistence';
+
+const MAX_PERSISTED_JOBS = 200;
+const MAX_DRAFT_INPUT_LENGTH = 200_000;
+const VALID_MODES = new Set<DownloadMode>([
+  'post',
+  'like',
+  'mix',
+  'music',
+  'collect',
+]);
+
+function toFiniteNumber(value: unknown, fallback: number): number {
+  const num = Number(value);
+  return Number.isFinite(num) ? num : fallback;
+}
+
+function normalizeSettings(
+  partial: Partial<BatchSettings>,
+  base: BatchSettings,
+): BatchSettings {
+  const merged: BatchSettings = {
+    ...base,
+    ...partial,
+  };
+
+  const validModes = Array.isArray(merged.modes)
+    ? merged.modes.filter((m): m is DownloadMode => VALID_MODES.has(m))
+    : [];
+
+  return {
+    ...merged,
+    downloadPath:
+      typeof merged.downloadPath === 'string' && merged.downloadPath.trim()
+        ? merged.downloadPath.trim()
+        : base.downloadPath,
+    modes: validModes.length > 0 ? Array.from(new Set(validModes)) : base.modes,
+    concurrency: Math.min(
+      12,
+      Math.max(1, Math.round(toFiniteNumber(merged.concurrency, base.concurrency))),
+    ),
+    retryTimes: Math.min(
+      10,
+      Math.max(0, Math.round(toFiniteNumber(merged.retryTimes, base.retryTimes))),
+    ),
+    rateLimitPerSec: Math.min(
+      20,
+      Math.max(0.5, toFiniteNumber(merged.rateLimitPerSec, base.rateLimitPerSec)),
+    ),
+    maxItemsPerMode: Math.max(
+      0,
+      Math.round(toFiniteNumber(merged.maxItemsPerMode, base.maxItemsPerMode)),
+    ),
+    startDate: typeof merged.startDate === 'string' ? merged.startDate : '',
+    endDate: typeof merged.endDate === 'string' ? merged.endDate : '',
+    cookieString: typeof merged.cookieString === 'string' ? merged.cookieString : '',
+    proxyUrl: typeof merged.proxyUrl === 'string' ? merged.proxyUrl : '',
+  };
+}
+
+function normalizePreferences(
+  partial: Partial<UiPreferences>,
+  base: UiPreferences,
+): UiPreferences {
+  const theme =
+    partial.theme === 'dark' || partial.theme === 'light'
+      ? partial.theme
+      : base.theme;
+  const draftInput =
+    typeof partial.draftInput === 'string'
+      ? partial.draftInput.slice(0, MAX_DRAFT_INPUT_LENGTH)
+      : base.draftInput;
+  return { theme, draftInput };
+}
+
+function isValidDiskFileRecord(entry: unknown): entry is DownloadedFileRecord {
+  if (!entry || typeof entry !== 'object') return false;
+  const rec = entry as Partial<DownloadedFileRecord>;
+  return (
+    typeof rec.filename === 'string' &&
+    typeof rec.absolutePath === 'string' &&
+    typeof rec.relativePath === 'string' &&
+    typeof rec.kind === 'string' &&
+    typeof rec.sizeBytes === 'number'
+  );
+}
 
 function buildArtifactLabels(work: DiscoveredWork, settings: BatchSettings): string[] {
   const list: string[] = [];
@@ -40,61 +129,268 @@ function buildArtifactLabels(work: DiscoveredWork, settings: BatchSettings): str
   return list.length > 0 ? list : ['元数据 JSON'];
 }
 
-class BatchJobStore {
+export class BatchJobStore {
   private settings: BatchSettings = {
     ...DEFAULT_BATCH_SETTINGS,
     cookieString: process.env.DOUYIN_COOKIE || '',
     proxyUrl: process.env.DOUYIN_PROXY || '',
   };
+  private preferences: UiPreferences = { ...DEFAULT_UI_PREFERENCES };
   private jobs = new Map<string, BatchJob>();
   private archive = new Map<string, ArchiveItem>();
   private itemDiskFiles = new Map<string, DownloadedFileRecord[]>();
   private archiveDiskFiles = new Map<string, DownloadedFileRecord[]>();
   private jobAbortControllers = new Map<string, AbortController>();
   private cancelledJobs = new Set<string>();
+  private persistence: PersistenceStore | null = null;
+  private initialized = false;
+
+  constructor(options?: { dataDir?: string }) {
+    if (options?.dataDir) {
+      this.configurePersistence(options.dataDir);
+    }
+  }
+
+  configurePersistence(dataDir?: string): string {
+    const resolvedDir = dataDir ? path.resolve(dataDir) : resolveDefaultDataDir();
+    if (this.initialized && this.persistence?.getDataDir() === resolvedDir) {
+      return resolvedDir;
+    }
+    this.persistence = new PersistenceStore(resolvedDir);
+    this.initialized = true;
+    this.loadFromDisk();
+    return resolvedDir;
+  }
+
+  getDataDir(): string {
+    this.ensureInitialized();
+    return this.persistence!.getDataDir();
+  }
+
+  flush(): void {
+    if (!this.initialized || !this.persistence) return;
+    this.persistSettingsNow();
+    this.persistStateNow();
+  }
+
+  private ensureInitialized(): void {
+    if (!this.initialized) {
+      this.configurePersistence();
+    }
+  }
+
+  private loadFromDisk(): void {
+    const store = this.persistence;
+    if (!store) return;
+
+    this.jobs.clear();
+    this.archive.clear();
+    this.itemDiskFiles.clear();
+    this.archiveDiskFiles.clear();
+    this.jobAbortControllers.clear();
+    this.cancelledJobs.clear();
+
+    const envDefaults: BatchSettings = {
+      ...DEFAULT_BATCH_SETTINGS,
+      cookieString: process.env.DOUYIN_COOKIE || '',
+      proxyUrl: process.env.DOUYIN_PROXY || '',
+    };
+
+    const { settings: savedSettings, preferences: savedPrefs } = store.loadSettings();
+    if (savedSettings) {
+      this.settings = normalizeSettings(savedSettings, DEFAULT_BATCH_SETTINGS);
+    } else {
+      this.settings = envDefaults;
+    }
+
+    if (savedPrefs) {
+      this.preferences = normalizePreferences(savedPrefs, DEFAULT_UI_PREFERENCES);
+    } else {
+      this.preferences = { ...DEFAULT_UI_PREFERENCES };
+    }
+
+    const savedState = store.loadState();
+    if (!savedState) return;
+
+    for (const [awemeId, files] of Object.entries(savedState.archiveDiskFiles)) {
+      if (Array.isArray(files)) {
+        const valid = files.filter(isValidDiskFileRecord);
+        if (valid.length > 0) {
+          this.archiveDiskFiles.set(awemeId, valid);
+        }
+      }
+    }
+
+    for (const [key, files] of Object.entries(savedState.itemDiskFiles)) {
+      if (Array.isArray(files)) {
+        const valid = files.filter(isValidDiskFileRecord);
+        if (valid.length > 0) {
+          this.itemDiskFiles.set(key, valid);
+        }
+      }
+    }
+
+    for (const item of savedState.archive) {
+      if (!item || typeof item.awemeId !== 'string' || !item.awemeId) continue;
+      const diskFiles = this.archiveDiskFiles.get(item.awemeId) || [];
+      this.archive.set(item.awemeId, {
+        ...item,
+        savedFiles: Array.isArray(item.savedFiles) ? item.savedFiles : [],
+        artifacts: Array.isArray(item.artifacts) ? item.artifacts : [],
+        filePresent:
+          diskFiles.length > 0
+            ? diskFiles.some((f) => fs.existsSync(f.absolutePath))
+            : Boolean(item.filePresent),
+      });
+    }
+
+    const now = new Date().toISOString();
+    let needsResave = false;
+
+    const sortedJobs = savedState.jobs
+      .filter((job): job is BatchJob => Boolean(job && typeof job.jobId === 'string'))
+      .sort(
+        (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
+      )
+      .slice(0, MAX_PERSISTED_JOBS);
+
+    for (const rawJob of sortedJobs) {
+      const items: JobItem[] = Array.isArray(rawJob.items)
+        ? rawJob.items.map((rawItem) => {
+            const item: JobItem = {
+              ...rawItem,
+              savedFiles: Array.isArray(rawItem.savedFiles) ? rawItem.savedFiles : [],
+              artifacts: Array.isArray(rawItem.artifacts) ? rawItem.artifacts : [],
+            };
+
+            if (item.status === 'running' || item.status === 'pending') {
+              item.status = 'cancelled';
+              item.progress = 0;
+              item.downloadReady = false;
+              item.message = '上次应用退出导致下载中断，可点击「重试失败项」继续';
+              item.updatedAt = now;
+              needsResave = true;
+            } else if (item.status === 'success' || item.status === 'skipped') {
+              const directFiles =
+                this.itemDiskFiles.get(`${rawJob.jobId}:${item.itemId}`) ||
+                this.archiveDiskFiles.get(item.awemeId) ||
+                [];
+              item.downloadReady = directFiles.some((f) => fs.existsSync(f.absolutePath));
+            }
+            return item;
+          })
+        : [];
+
+      const job: BatchJob = {
+        ...rawJob,
+        sourceUrls: Array.isArray(rawJob.sourceUrls) ? rawJob.sourceUrls : [],
+        warnings: Array.isArray(rawJob.warnings) ? rawJob.warnings : [],
+        items,
+      };
+
+      if (job.status === 'running' || job.status === 'pending') {
+        this.refreshJobSummary(job);
+        if (
+          job.items.length > 0 &&
+          job.failed === 0 &&
+          job.items.every((i) => i.status === 'success' || i.status === 'skipped')
+        ) {
+          job.status = 'success';
+        } else if (job.success > 0 || job.skipped > 0) {
+          job.status = 'partial';
+        } else {
+          job.status = 'cancelled';
+        }
+        job.finishedAt = job.finishedAt || now;
+        needsResave = true;
+      } else {
+        this.refreshJobSummary(job);
+      }
+
+      this.jobs.set(job.jobId, job);
+    }
+
+    if (needsResave) {
+      this.persistStateNow();
+    }
+  }
+
+  private persistSettingsNow(): void {
+    if (!this.persistence) return;
+    this.persistence.saveSettings(this.settings, this.preferences);
+  }
+
+  private persistStateNow(): void {
+    if (!this.persistence) return;
+
+    const sortedJobs = Array.from(this.jobs.values())
+      .sort(
+        (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
+      )
+      .slice(0, MAX_PERSISTED_JOBS);
+
+    const activeJobIds = new Set(sortedJobs.map((j) => j.jobId));
+    const itemDiskFilesObj: Record<string, DownloadedFileRecord[]> = {};
+    for (const [key, files] of this.itemDiskFiles.entries()) {
+      const jobId = key.split(':')[0];
+      if (activeJobIds.has(jobId) && files.length > 0) {
+        itemDiskFilesObj[key] = files;
+      }
+    }
+
+    const archiveDiskFilesObj: Record<string, DownloadedFileRecord[]> = {};
+    for (const [awemeId, files] of this.archiveDiskFiles.entries()) {
+      if (this.archive.has(awemeId) && files.length > 0) {
+        archiveDiskFilesObj[awemeId] = files;
+      }
+    }
+
+    this.persistence.saveState({
+      jobs: sortedJobs,
+      archive: Array.from(this.archive.values()),
+      itemDiskFiles: itemDiskFilesObj,
+      archiveDiskFiles: archiveDiskFilesObj,
+    });
+  }
 
   getSettings(): BatchSettings {
+    this.ensureInitialized();
     return { ...this.settings };
   }
 
   updateSettings(partial: Partial<BatchSettings>): BatchSettings {
-    this.settings = {
-      ...this.settings,
-      ...partial,
-      concurrency: Math.min(
-        12,
-        Math.max(1, Number(partial.concurrency ?? this.settings.concurrency) || 3),
-      ),
-      retryTimes: Math.min(
-        10,
-        Math.max(0, Number(partial.retryTimes ?? this.settings.retryTimes) || 3),
-      ),
-      rateLimitPerSec: Math.min(
-        20,
-        Math.max(
-          0.5,
-          Number(partial.rateLimitPerSec ?? this.settings.rateLimitPerSec) || 2,
-        ),
-      ),
-      maxItemsPerMode: Math.max(
-        0,
-        Number(partial.maxItemsPerMode ?? this.settings.maxItemsPerMode) || 0,
-      ),
-    };
+    this.ensureInitialized();
+    this.settings = normalizeSettings(partial, this.settings);
+    this.persistSettingsNow();
     return this.getSettings();
   }
 
+  getPreferences(): UiPreferences {
+    this.ensureInitialized();
+    return { ...this.preferences };
+  }
+
+  updatePreferences(partial: Partial<UiPreferences>): UiPreferences {
+    this.ensureInitialized();
+    this.preferences = normalizePreferences(partial, this.preferences);
+    this.persistSettingsNow();
+    return this.getPreferences();
+  }
+
   listJobs(): BatchJob[] {
+    this.ensureInitialized();
     return Array.from(this.jobs.values()).sort(
       (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
     );
   }
 
   getJob(jobId: string): BatchJob | undefined {
+    this.ensureInitialized();
     return this.jobs.get(jobId);
   }
 
   deleteJob(jobId: string): boolean {
+    this.ensureInitialized();
     this.cancelJob(jobId);
     const job = this.jobs.get(jobId);
     if (job) {
@@ -102,13 +398,20 @@ class BatchJobStore {
         this.itemDiskFiles.delete(`${jobId}:${item.itemId}`);
       }
     }
-    return this.jobs.delete(jobId);
+    const deleted = this.jobs.delete(jobId);
+    if (deleted) {
+      this.persistStateNow();
+    }
+    return deleted;
   }
 
   listArchive(): ArchiveItem[] {
+    this.ensureInitialized();
     for (const [awemeId, arch] of this.archive.entries()) {
       const files = this.archiveDiskFiles.get(awemeId) || [];
-      arch.filePresent = files.some((f) => fs.existsSync(f.absolutePath));
+      if (files.length > 0) {
+        arch.filePresent = files.some((f) => fs.existsSync(f.absolutePath));
+      }
     }
     return Array.from(this.archive.values()).sort(
       (a, b) =>
@@ -117,11 +420,17 @@ class BatchJobStore {
   }
 
   deleteArchiveItem(awemeId: string): boolean {
+    this.ensureInitialized();
     this.archiveDiskFiles.delete(awemeId);
-    return this.archive.delete(awemeId);
+    const deleted = this.archive.delete(awemeId);
+    if (deleted) {
+      this.persistStateNow();
+    }
+    return deleted;
   }
 
   toggleArchiveFilePresent(awemeId: string): ArchiveItem | undefined {
+    this.ensureInitialized();
     const existing = this.archive.get(awemeId);
     if (!existing) return undefined;
     const updated: ArchiveItem = {
@@ -129,10 +438,12 @@ class BatchJobStore {
       filePresent: !existing.filePresent,
     };
     this.archive.set(awemeId, updated);
+    this.persistStateNow();
     return updated;
   }
 
   getItemFiles(jobId: string, itemId: string): DownloadedFileRecord[] {
+    this.ensureInitialized();
     const direct = this.itemDiskFiles.get(`${jobId}:${itemId}`);
     if (direct && direct.length > 0) return direct;
     const job = this.jobs.get(jobId);
@@ -144,6 +455,7 @@ class BatchJobStore {
   }
 
   getJobAllFiles(jobId: string): DownloadedFileRecord[] {
+    this.ensureInitialized();
     const job = this.jobs.get(jobId);
     if (!job) return [];
     const seenPaths = new Set<string>();
@@ -161,6 +473,7 @@ class BatchJobStore {
   }
 
   getArchiveFiles(awemeId: string): DownloadedFileRecord[] {
+    this.ensureInitialized();
     return (this.archiveDiskFiles.get(awemeId) || []).filter((f) =>
       fs.existsSync(f.absolutePath),
     );
@@ -176,10 +489,11 @@ class BatchJobStore {
     warnings: string[];
     requiresCookie: boolean;
   }> {
-    const merged: BatchSettings = {
-      ...this.settings,
-      ...(overrideSettings || {}),
-    };
+    this.ensureInitialized();
+    const merged: BatchSettings =
+      overrideSettings && Object.keys(overrideSettings).length > 0
+        ? this.updateSettings(overrideSettings)
+        : this.getSettings();
     const { links } = parseBatchInput(rawText);
 
     const resolvedLinks: ParsedLink[] = await resolveParsedLinks(links, {
@@ -221,13 +535,11 @@ class BatchJobStore {
     },
     overrideSettings?: Partial<BatchSettings>,
   ): Promise<BatchJob> {
-    const merged: BatchSettings = {
-      ...this.settings,
-      ...(overrideSettings || {}),
-    };
-    if (overrideSettings?.cookieString !== undefined) {
-      this.settings.cookieString = overrideSettings.cookieString;
-    }
+    this.ensureInitialized();
+    const merged: BatchSettings =
+      overrideSettings && Object.keys(overrideSettings).length > 0
+        ? this.updateSettings(overrideSettings)
+        : this.getSettings();
 
     const jobId = `job-${crypto.randomBytes(4).toString('hex')}`;
     const now = new Date().toISOString();
@@ -355,9 +667,11 @@ class BatchJobStore {
     this.jobs.set(jobId, job);
 
     if (items.some((i) => i.status === 'pending')) {
+      this.persistStateNow();
       void this.runJobWorkerPool(jobId, merged);
     } else {
       job.finishedAt = new Date().toISOString();
+      this.persistStateNow();
     }
 
     return job;
@@ -385,6 +699,7 @@ class BatchJobStore {
 
     job.status = 'running';
     job.startedAt = job.startedAt || new Date().toISOString();
+    this.persistStateNow();
 
     const pendingItems = job.items.filter((i) => i.status === 'pending');
     let cursor = 0;
@@ -418,6 +733,7 @@ class BatchJobStore {
       this.refreshJobSummary(job);
       job.status = 'cancelled';
       job.finishedAt = new Date().toISOString();
+      this.persistStateNow();
       return;
     }
 
@@ -430,6 +746,7 @@ class BatchJobStore {
     } else {
       job.status = 'failed';
     }
+    this.persistStateNow();
   }
 
   private async downloadSingleItem(
@@ -490,12 +807,18 @@ class BatchJobStore {
           sizeBytes: f.sizeBytes,
         }));
 
+        const relOutputDir = path.relative(process.cwd(), result.outputDir);
+        const displayOutputDir =
+          relOutputDir && !relOutputDir.startsWith('..')
+            ? relOutputDir
+            : result.outputDir;
+
         item.sizeBytes = result.totalBytes;
         item.savedFiles = savedMeta;
         item.downloadReady = result.files.length > 0;
         item.status = 'success';
         item.progress = 100;
-        item.message = `已真实下载 ${result.files.length} 个文件至 ${path.relative(process.cwd(), result.outputDir)}`;
+        item.message = `已真实下载 ${result.files.length} 个文件至 ${displayOutputDir}`;
         item.updatedAt = new Date().toISOString();
 
         this.archive.set(item.awemeId, {
@@ -518,6 +841,7 @@ class BatchJobStore {
         });
 
         this.refreshJobSummary(job);
+        this.persistStateNow();
         return;
       } catch (err) {
         lastError = err instanceof Error ? err.message : 'CDN 下载异常';
@@ -536,9 +860,11 @@ class BatchJobStore {
     item.message = lastError;
     item.updatedAt = new Date().toISOString();
     this.refreshJobSummary(job);
+    this.persistStateNow();
   }
 
   cancelJob(jobId: string): BatchJob | undefined {
+    this.ensureInitialized();
     const job = this.jobs.get(jobId);
     if (!job) return undefined;
     this.cancelledJobs.add(jobId);
@@ -554,11 +880,13 @@ class BatchJobStore {
       this.refreshJobSummary(job);
       job.status = 'cancelled';
       job.finishedAt = new Date().toISOString();
+      this.persistStateNow();
     }
     return job;
   }
 
   retryFailedItems(jobId: string): BatchJob | undefined {
+    this.ensureInitialized();
     const job = this.jobs.get(jobId);
     if (!job) return undefined;
     let retried = 0;
@@ -575,6 +903,7 @@ class BatchJobStore {
     if (retried > 0) {
       this.refreshJobSummary(job);
       job.finishedAt = undefined;
+      this.persistStateNow();
       void this.runJobWorkerPool(jobId, {
         ...job.settingsSnapshot,
         cookieString: this.settings.cookieString,
@@ -587,6 +916,7 @@ class BatchJobStore {
     jobId: string,
     format: 'yaml' | 'jsonl' | 'manifest',
   ): { filename: string; contentType: string; body: string } | null {
+    this.ensureInitialized();
     const job = this.jobs.get(jobId);
     if (!job) return null;
 

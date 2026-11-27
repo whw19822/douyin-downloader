@@ -5,6 +5,7 @@ import type {
   DiscoveredWork,
   HotBoardItem,
   ParsedLink,
+  UiPreferences,
 } from './types';
 
 async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
@@ -116,6 +117,17 @@ export function updateSettingsApi(settings: Partial<BatchSettings>) {
   return requestJson<{ settings: BatchSettings; yaml: string }>('/api/settings', {
     method: 'PUT',
     body: JSON.stringify(settings),
+  });
+}
+
+export function getPreferencesApi() {
+  return requestJson<{ preferences: UiPreferences }>('/api/preferences');
+}
+
+export function updatePreferencesApi(preferences: Partial<UiPreferences>) {
+  return requestJson<{ preferences: UiPreferences }>('/api/preferences', {
+    method: 'PUT',
+    body: JSON.stringify(preferences),
   });
 }
 

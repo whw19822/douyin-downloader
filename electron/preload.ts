@@ -4,6 +4,7 @@ export interface DesktopInfo {
   isDesktop: boolean;
   platform: string;
   downloadDir: string;
+  dataDir?: string;
   appVersion: string;
 }
 

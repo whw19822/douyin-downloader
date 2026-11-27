@@ -36,6 +36,7 @@ logs/
 # Runtime output
 Downloaded/
 Transcripts/
+.douyin-studio-data/
 dy_downloader.db
 *.db
 *.sqlite
