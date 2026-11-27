@@ -520,6 +520,32 @@ async function openCdpSession(): Promise<CdpSession> {
   return openExternalChromeCdpSession();
 }
 
+export type ScrapeTargetKind =
+  | 'single'
+  | 'user_post'
+  | 'user_like'
+  | 'user_mix_list'
+  | 'user_collect'
+  | 'collection'
+  | 'music';
+
+export interface ScrapeTarget {
+  kind: ScrapeTargetKind;
+  expectedSecUid?: string;
+  expectedMixId?: string;
+  expectedMusicId?: string;
+  expectedAwemeId?: string;
+  strictAuthorFilter: boolean;
+}
+
+export interface DiscoveredMixSummary {
+  mixId: string;
+  mixName: string;
+  authorSecUid?: string;
+  authorNickname?: string;
+  expectedEpisodeCount?: number;
+}
+
 interface ScrapeOptions {
   quality: VideoQuality;
   cookieString?: string;
@@ -529,272 +555,1248 @@ interface ScrapeOptions {
   endDate?: string;
   sourceUrl: string;
   paginate: boolean;
+  target: ScrapeTarget;
 }
 
-async function scrapePageViaChromium(
-  targetUrl: string,
-  options: ScrapeOptions,
-): Promise<{
+interface PageScrapeResult {
   works: DiscoveredWork[];
+  mixes: DiscoveredMixSummary[];
   profile?: CreatorProfileSummary;
+  collectionOwnerSecUid?: string;
+  collectionOwnerNickname?: string;
+  expectedCollectionEpisodes?: number;
+  filteredOtherAuthorCount: number;
   emptyBlockedResponses: number;
   loginRequired: boolean;
   hasMoreRemaining: boolean;
   warnings: string[];
-}> {
-  const session = await openCdpSession();
+}
+
+interface ScrollStepResult {
+  moved: boolean;
+  maxScrollHeight: number;
+  wheelTargets: Array<{ x: number; y: number }>;
+  reachedBottomText: boolean;
+  isLoading: boolean;
+}
+
+const MAX_SCROLL_ROUNDS = 600;
+const MAX_CRAWL_DURATION_MS = 8 * 60_000;
+const MAX_IDLE_ROUNDS = 8;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+export function getApiQueryParam(apiUrl: string, keys: string[]): string | undefined {
+  if (!apiUrl) return undefined;
+  try {
+    const parsed = new URL(apiUrl, 'https://www.douyin.com');
+    for (const key of keys) {
+      const val = parsed.searchParams.get(key)?.trim();
+      if (val) return val;
+    }
+  } catch {
+    // ignore malformed URLs
+  }
+  return undefined;
+}
+
+export function classifyDouyinApiUrl(
+  apiUrl: string,
+  target: ScrapeTarget,
+): 'target' | 'profile' | 'mix_detail' | 'ignore' {
+  if (!apiUrl) return 'ignore';
+
+  if (apiUrl.includes('/aweme/v1/web/user/profile/other')) {
+    if (
+      target.kind === 'user_post' ||
+      target.kind === 'user_like' ||
+      target.kind === 'user_mix_list' ||
+      target.kind === 'user_collect'
+    ) {
+      const reqSecUid = getApiQueryParam(apiUrl, ['sec_user_id', 'sec_uid']);
+      if (target.expectedSecUid && reqSecUid && reqSecUid !== target.expectedSecUid) {
+        return 'ignore';
+      }
+      return 'profile';
+    }
+    return 'ignore';
+  }
+
+  if (apiUrl.includes('/aweme/v1/web/mix/detail')) {
+    if (target.kind === 'collection') {
+      const reqMixId = getApiQueryParam(apiUrl, ['mix_id']);
+      if (target.expectedMixId && reqMixId && reqMixId !== target.expectedMixId) {
+        return 'ignore';
+      }
+      return 'mix_detail';
+    }
+    return 'ignore';
+  }
+
+  switch (target.kind) {
+    case 'single': {
+      if (!apiUrl.includes('/aweme/v1/web/aweme/detail')) return 'ignore';
+      const reqAwemeId = getApiQueryParam(apiUrl, ['aweme_id']);
+      if (target.expectedAwemeId && reqAwemeId && reqAwemeId !== target.expectedAwemeId) {
+        return 'ignore';
+      }
+      return 'target';
+    }
+    case 'user_post': {
+      if (!apiUrl.includes('/aweme/v1/web/aweme/post')) return 'ignore';
+      const reqSecUid = getApiQueryParam(apiUrl, ['sec_user_id', 'sec_uid']);
+      if (target.expectedSecUid && reqSecUid && reqSecUid !== target.expectedSecUid) {
+        return 'ignore';
+      }
+      return 'target';
+    }
+    case 'user_like': {
+      if (!apiUrl.includes('/aweme/v1/web/aweme/favorite')) return 'ignore';
+      const reqSecUid = getApiQueryParam(apiUrl, ['sec_user_id', 'sec_uid']);
+      if (target.expectedSecUid && reqSecUid && reqSecUid !== target.expectedSecUid) {
+        return 'ignore';
+      }
+      return 'target';
+    }
+    case 'user_collect': {
+      if (
+        !apiUrl.includes('/aweme/v1/web/aweme/listcollection') &&
+        !apiUrl.includes('/aweme/v1/web/aweme/collect')
+      ) {
+        return 'ignore';
+      }
+      return 'target';
+    }
+    case 'user_mix_list': {
+      if (!apiUrl.includes('/aweme/v1/web/mix/list')) return 'ignore';
+      const reqSecUid = getApiQueryParam(apiUrl, ['sec_user_id', 'sec_uid']);
+      if (target.expectedSecUid && reqSecUid && reqSecUid !== target.expectedSecUid) {
+        return 'ignore';
+      }
+      return 'target';
+    }
+    case 'collection': {
+      if (!apiUrl.includes('/aweme/v1/web/mix/aweme')) return 'ignore';
+      const reqMixId = getApiQueryParam(apiUrl, ['mix_id']);
+      if (target.expectedMixId && reqMixId && reqMixId !== target.expectedMixId) {
+        return 'ignore';
+      }
+      return 'target';
+    }
+    case 'music': {
+      if (!apiUrl.includes('/aweme/v1/web/music/aweme')) return 'ignore';
+      const reqMusicId = getApiQueryParam(apiUrl, ['music_id']);
+      if (target.expectedMusicId && reqMusicId && reqMusicId !== target.expectedMusicId) {
+        return 'ignore';
+      }
+      return 'target';
+    }
+    default:
+      return 'ignore';
+  }
+}
+
+export function shouldAcceptWorkForTarget(
+  raw: RawAweme | null,
+  media: ParsedAwemeMedia,
+  target: ScrapeTarget,
+  resolvedOwnerSecUid?: string,
+  resolvedOwnerNickname?: string,
+): { accepted: boolean; reason?: 'other_author' | 'other_mix' | 'other_aweme' } {
+  if (target.kind === 'single' && target.expectedAwemeId) {
+    if (media.awemeId !== target.expectedAwemeId) {
+      return { accepted: false, reason: 'other_aweme' };
+    }
+  }
+
+  if (target.kind === 'collection' && target.expectedMixId) {
+    const rawMixId = raw?.mix_info?.mix_id;
+    if (rawMixId !== undefined && rawMixId !== null && String(rawMixId).trim()) {
+      if (String(rawMixId).trim() !== target.expectedMixId) {
+        return { accepted: false, reason: 'other_mix' };
+      }
+    }
+  }
+
+  if (target.strictAuthorFilter) {
+    const ownerSecUid = (resolvedOwnerSecUid || target.expectedSecUid || '').trim();
+    if (ownerSecUid) {
+      if (media.authorId) {
+        if (media.authorId !== ownerSecUid) {
+          return { accepted: false, reason: 'other_author' };
+        }
+      } else if (resolvedOwnerNickname) {
+        if (media.author !== resolvedOwnerNickname) {
+          return { accepted: false, reason: 'other_author' };
+        }
+      } else {
+        return { accepted: false, reason: 'other_author' };
+      }
+    }
+  }
+
+  return { accepted: true };
+}
+
+export function resolveDominantAuthorSecUid(works: DiscoveredWork[]): string | undefined {
+  const counts = new Map<string, number>();
+  for (const work of works) {
+    const id = work.authorId?.trim();
+    if (!id) continue;
+    counts.set(id, (counts.get(id) || 0) + 1);
+  }
+  let bestId: string | undefined;
+  let bestCount = 0;
+  for (const [id, count] of counts.entries()) {
+    if (count > bestCount) {
+      bestId = id;
+      bestCount = count;
+    }
+  }
+  return bestId;
+}
+
+export function buildNextCursorApiUrl(
+  templateUrl: string,
+  cursorParam: 'cursor' | 'max_cursor',
+  nextCursor: string | number,
+): string | null {
+  if (!templateUrl) return null;
+  try {
+    const parsed = new URL(templateUrl, 'https://www.douyin.com');
+    parsed.searchParams.set(cursorParam, String(nextCursor));
+    parsed.searchParams.delete('a_bogus');
+    parsed.searchParams.delete('X-Bogus');
+    parsed.searchParams.delete('_signature');
+    return `${parsed.pathname}${parsed.search}`;
+  } catch {
+    return null;
+  }
+}
+
+function getCursorParamName(kind: ScrapeTargetKind): 'cursor' | 'max_cursor' {
+  if (kind === 'user_post' || kind === 'user_like') {
+    return 'max_cursor';
+  }
+  return 'cursor';
+}
+
+function extractNextCursorFromPayload(
+  data: Record<string, unknown>,
+  kind: ScrapeTargetKind,
+): string | undefined {
+  const primaryKey = getCursorParamName(kind);
+  const candidates =
+    primaryKey === 'max_cursor'
+      ? [data.max_cursor, data.cursor]
+      : [data.cursor, data.max_cursor];
+  for (const val of candidates) {
+    if (typeof val === 'number' && Number.isFinite(val) && val > 0) {
+      return String(val);
+    }
+    if (typeof val === 'string' && val.trim() && val.trim() !== '0') {
+      return val.trim();
+    }
+  }
+  return undefined;
+}
+
+async function prepareCdpSession(session: CdpSession, cookieString?: string): Promise<void> {
+  await session.send('Network.enable');
+  await session.send('Page.enable');
+  await session.send('Page.addScriptToEvaluateOnNewDocument', {
+    source: `
+      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+      Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+      Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en'] });
+      window.chrome = { runtime: {} };
+    `,
+  });
+
+  const parsedCookies = parseCookieString(cookieString || '');
+  if (parsedCookies.length > 0) {
+    const cdpCookies: Array<Record<string, unknown>> = parsedCookies.flatMap<
+      Record<string, unknown>
+    >((c) => {
+      if (c.name.startsWith('__Host-')) {
+        return [
+          {
+            name: c.name,
+            value: c.value,
+            url: 'https://www.douyin.com',
+            path: '/',
+            secure: true,
+          },
+        ];
+      }
+      const secure = c.name.startsWith('__Secure-') ? true : undefined;
+      return [
+        { ...c, domain: '.douyin.com', ...(secure ? { secure } : {}) },
+        { ...c, domain: '.iesdouyin.com', ...(secure ? { secure } : {}) },
+      ];
+    });
+    try {
+      await session.send('Network.setCookies', { cookies: cdpCookies });
+    } catch {
+      for (const cookie of cdpCookies) {
+        await session.send('Network.setCookie', cookie).catch(() => undefined);
+      }
+    }
+  }
+}
+
+async function dismissBlockingModals(session: CdpSession): Promise<void> {
+  await session
+    .send('Runtime.evaluate', {
+      expression: `(() => {
+        let closed = false;
+        const selectors = [
+          '.dy-account-close',
+          '[class*="login"] [class*="close"]',
+          '[id*="login"] [class*="close"]',
+          '[class*="modal"] [aria-label*="关闭"]',
+          '[role="dialog"] [aria-label*="关闭"]',
+          '[aria-label="关闭"]'
+        ];
+        for (const sel of selectors) {
+          const nodes = Array.from(document.querySelectorAll(sel));
+          for (const el of nodes) {
+            const rect = el.getBoundingClientRect ? el.getBoundingClientRect() : null;
+            if (rect && rect.width > 0 && rect.height > 0 && typeof el.click === 'function') {
+              el.click();
+              closed = true;
+            }
+          }
+        }
+        if (closed) {
+          if (document.body && document.body.style.overflow === 'hidden') {
+            document.body.style.overflow = '';
+          }
+          if (document.documentElement && document.documentElement.style.overflow === 'hidden') {
+            document.documentElement.style.overflow = '';
+          }
+        }
+      })()`,
+    })
+    .catch(() => undefined);
+}
+
+async function clickUserHomepageTab(session: CdpSession, tabLabel: string): Promise<boolean> {
+  const res = await session
+    .send('Runtime.evaluate', {
+      returnByValue: true,
+      expression: `(() => {
+        const label = ${JSON.stringify(tabLabel)};
+        const isMatch = (text) => {
+          const t = (text || '').replace(/\\s+/g, ' ').trim();
+          return t === label || t.startsWith(label + ' ') || new RegExp('^' + label + '\\\\s*\\\\d').test(t);
+        };
+        const priority = Array.from(document.querySelectorAll('[role="tab"], [data-e2e*="tab"]'));
+        const fallback = Array.from(document.querySelectorAll('a, button, div, span')).filter(
+          (el) => el.childElementCount <= 2
+        );
+        const candidates = [...priority, ...fallback];
+        for (const el of candidates) {
+          const rect = el.getBoundingClientRect ? el.getBoundingClientRect() : null;
+          if (!rect || rect.width < 16 || rect.height < 12 || rect.top < 0 || rect.top > 850) {
+            continue;
+          }
+          if (isMatch(el.textContent || '')) {
+            if (typeof el.scrollIntoView === 'function') {
+              el.scrollIntoView({ behavior: 'instant', block: 'center' });
+            }
+            if (typeof el.click === 'function') {
+              el.click();
+              return true;
+            }
+          }
+        }
+        return false;
+      })()`,
+    })
+    .catch(() => ({ result: { value: false } }));
+
+  return Boolean((res.result as { value?: unknown })?.value);
+}
+
+async function performMouseAndContainerScroll(
+  session: CdpSession,
+  kind: ScrapeTargetKind,
+  nudge: boolean,
+): Promise<ScrollStepResult> {
+  const isCollectionMode = kind === 'collection';
+
+  if (nudge) {
+    // Back up slightly first so IntersectionObserver bottom sentinels re-trigger when we scroll down again
+    await session
+      .send('Runtime.evaluate', {
+        expression: `(() => {
+          const isScrollable = (el) => {
+            if (!el) return false;
+            const style = window.getComputedStyle(el);
+            const oy = style ? style.overflowY : '';
+            return (oy === 'auto' || oy === 'scroll' || oy === 'overlay') && el.scrollHeight > el.clientHeight + 20;
+          };
+          const targets = new Set();
+          if (document.scrollingElement && document.scrollingElement.scrollHeight > document.scrollingElement.clientHeight + 20) {
+            targets.add(document.scrollingElement);
+          }
+          for (const sel of ['#douyin-right-container', '#parent-route-container']) {
+            const el = document.querySelector(sel);
+            if (el && el.scrollHeight > el.clientHeight + 20) targets.add(el);
+          }
+          for (const el of Array.from(document.querySelectorAll('div, main, section, ul, aside'))) {
+            if (isScrollable(el)) {
+              const r = el.getBoundingClientRect();
+              if (r.width >= 180 && r.height >= 150) targets.add(el);
+            }
+          }
+          for (const el of targets) {
+            el.scrollTop = Math.max(0, el.scrollTop - 360);
+            el.dispatchEvent(new Event('scroll', { bubbles: true }));
+          }
+          window.scrollBy(0, -360);
+        })()`,
+      })
+      .catch(() => undefined);
+    await sleep(220);
+  }
+
+  const evalRes = await session
+    .send('Runtime.evaluate', {
+      returnByValue: true,
+      expression: `JSON.stringify((() => {
+        const isCollection = ${JSON.stringify(isCollectionMode)};
+        const isNudge = ${JSON.stringify(nudge)};
+
+        const isVisible = (el) => {
+          if (!el || !el.getBoundingClientRect) return false;
+          const r = el.getBoundingClientRect();
+          return r.width >= 160 && r.height >= 140 && r.bottom > 0 && r.right > 0 && r.top < window.innerHeight && r.left < window.innerWidth;
+        };
+
+        const isScrollable = (el) => {
+          if (!el) return false;
+          if (el === document.scrollingElement || el === document.documentElement || el === document.body) {
+            return el.scrollHeight > window.innerHeight + 10;
+          }
+          const style = window.getComputedStyle(el);
+          const oy = style ? style.overflowY : '';
+          return (oy === 'auto' || oy === 'scroll' || oy === 'overlay') && el.scrollHeight > el.clientHeight + 10;
+        };
+
+        const scored = new Map();
+        const addCandidate = (el, bonus) => {
+          if (!el || !isScrollable(el)) return;
+          if (el !== document.scrollingElement && el !== document.documentElement && el !== document.body && !isVisible(el)) {
+            return;
+          }
+          const prev = scored.get(el) || 0;
+          scored.set(el, Math.max(prev, bonus));
+        };
+
+        if (document.scrollingElement) {
+          addCandidate(document.scrollingElement, isCollection ? 30 : 60);
+        }
+
+        const anchorSelectors = isCollection
+          ? [
+              '[data-e2e*="mix"]',
+              '[data-e2e*="collection"]',
+              '[class*="mix"]',
+              '[class*="collection"]',
+              '[class*="episode"]',
+              '[data-e2e="scroll-list"]',
+              '#douyin-right-container',
+              '#parent-route-container'
+            ]
+          : [
+              '[data-e2e="user-post-list"]',
+              '[data-e2e="user-like-list"]',
+              '[data-e2e="user-mix-list"]',
+              '[data-e2e="scroll-list"]',
+              '#douyin-right-container',
+              '#parent-route-container'
+            ];
+
+        for (const sel of anchorSelectors) {
+          const nodes = Array.from(document.querySelectorAll(sel));
+          for (const node of nodes) {
+            addCandidate(node, 110);
+            let cur = node.parentElement;
+            let depth = 0;
+            while (cur && depth < 6) {
+              addCandidate(cur, 100 - depth * 5);
+              cur = cur.parentElement;
+              depth += 1;
+            }
+          }
+        }
+
+        for (const el of Array.from(document.querySelectorAll('div, main, section, ul, aside'))) {
+          if (!isScrollable(el) || !isVisible(el)) continue;
+          const linkCount = el.querySelectorAll('a[href*="/video/"], a[href*="/note/"], a[href*="/collection/"]').length;
+          const cls = String(el.className || '').toLowerCase();
+          const hasMixHint = cls.includes('mix') || cls.includes('collection') || cls.includes('episode') || cls.includes('list');
+          let score = 20 + Math.min(40, linkCount * 4);
+          if (isCollection && hasMixHint) score += 70;
+          if (isCollection && linkCount >= 3) score += 45;
+          addCandidate(el, score);
+        }
+
+        const ranked = Array.from(scored.entries())
+          .sort((a, b) => {
+            if (b[1] !== a[1]) return b[1] - a[1];
+            return (b[0].scrollHeight || 0) - (a[0].scrollHeight || 0);
+          })
+          .map(([el]) => el)
+          .slice(0, 5);
+
+        let moved = false;
+        let maxScrollHeight = Math.max(
+          document.body ? document.body.scrollHeight : 0,
+          document.documentElement ? document.documentElement.scrollHeight : 0
+        );
+        const wheelTargets = [];
+
+        for (const el of ranked) {
+          const beforeTop = el.scrollTop || 0;
+          const sh = el.scrollHeight || 0;
+          const ch = el.clientHeight || window.innerHeight || 900;
+          if (sh > maxScrollHeight) maxScrollHeight = sh;
+
+          // Stepped scroll followed by bottom scroll to wake virtualized lists & IntersectionObservers
+          const stepped = Math.min(sh, beforeTop + Math.max(Math.round(ch * 0.9), 800));
+          el.scrollTop = stepped;
+          el.dispatchEvent(new Event('scroll', { bubbles: true }));
+          el.scrollTop = sh;
+          el.dispatchEvent(new Event('scroll', { bubbles: true }));
+
+          if (Math.abs((el.scrollTop || 0) - beforeTop) > 4) {
+            moved = true;
+          }
+
+          if (wheelTargets.length < 2) {
+            if (el === document.scrollingElement || el === document.documentElement || el === document.body) {
+              wheelTargets.push({ x: Math.round(window.innerWidth * 0.5), y: Math.round(window.innerHeight * 0.6) });
+            } else {
+              const r = el.getBoundingClientRect();
+              wheelTargets.push({
+                x: Math.round(Math.max(40, Math.min(window.innerWidth - 40, r.left + r.width * 0.5))),
+                y: Math.round(Math.max(40, Math.min(window.innerHeight - 40, r.top + r.height * 0.55)))
+              });
+            }
+          }
+        }
+
+        // Scroll the last rendered card into view inside primary list
+        const lastItemSelectors = isCollection
+          ? [
+              '[data-e2e*="mix"] li:last-child',
+              '[data-e2e*="mix"] a[href*="/video/"]',
+              '[class*="mix"] a[href*="/video/"]',
+              '[class*="collection"] a[href*="/video/"]',
+              '[data-e2e="scroll-list"] > *:last-child'
+            ]
+          : [
+              '[data-e2e="user-post-list"] li:last-child',
+              '[data-e2e="user-like-list"] li:last-child',
+              '[data-e2e="user-mix-list"] li:last-child',
+              '[data-e2e="scroll-list"] > *:last-child'
+            ];
+        for (const sel of lastItemSelectors) {
+          const matches = document.querySelectorAll(sel);
+          if (matches.length > 0) {
+            const last = matches[matches.length - 1];
+            if (last && typeof last.scrollIntoView === 'function') {
+              last.scrollIntoView({ behavior: 'instant', block: 'end' });
+              break;
+            }
+          }
+        }
+
+        const beforeWinY = window.scrollY || 0;
+        window.scrollTo(0, maxScrollHeight);
+        window.dispatchEvent(new Event('scroll'));
+        if (Math.abs((window.scrollY || 0) - beforeWinY) > 4) {
+          moved = true;
+        }
+
+        if (isNudge) {
+          const loadMoreKeywords = ['加载更多', '查看更多', '展开更多', '展开全部'];
+          const btns = Array.from(document.querySelectorAll('button, [role="button"], div, span')).filter(
+            (el) => el.childElementCount === 0
+          );
+          for (const btn of btns) {
+            const txt = (btn.textContent || '').trim();
+            if (txt.length <= 12 && loadMoreKeywords.some((kw) => txt === kw)) {
+              const r = btn.getBoundingClientRect ? btn.getBoundingClientRect() : null;
+              if (r && r.width > 10 && r.height > 10 && typeof btn.click === 'function') {
+                btn.click();
+                break;
+              }
+            }
+          }
+        }
+
+        const bodyText = (document.body && document.body.innerText ? document.body.innerText : '').slice(-4000);
+        const reachedBottomText =
+          bodyText.includes('暂时没有更多了') ||
+          bodyText.includes('没有更多了') ||
+          bodyText.includes('已经到底了');
+        const isLoading = bodyText.includes('加载中');
+
+        return {
+          moved,
+          maxScrollHeight,
+          wheelTargets: wheelTargets.length > 0 ? wheelTargets : [{ x: 720, y: 500 }],
+          reachedBottomText,
+          isLoading
+        };
+      })())`,
+    })
+    .catch(() => ({ result: { value: '' } }));
+
+  let parsed: ScrollStepResult = {
+    moved: false,
+    maxScrollHeight: 0,
+    wheelTargets: [{ x: 720, y: 500 }],
+    reachedBottomText: false,
+    isLoading: false,
+  };
+  try {
+    const rawVal = String((evalRes.result as { value?: string })?.value || '');
+    if (rawVal) {
+      const obj = JSON.parse(rawVal) as Partial<ScrollStepResult>;
+      parsed = {
+        moved: Boolean(obj.moved),
+        maxScrollHeight: Number(obj.maxScrollHeight || 0),
+        wheelTargets:
+          Array.isArray(obj.wheelTargets) && obj.wheelTargets.length > 0
+            ? obj.wheelTargets
+            : [{ x: 720, y: 500 }],
+        reachedBottomText: Boolean(obj.reachedBottomText),
+        isLoading: Boolean(obj.isLoading),
+      };
+    }
+  } catch {
+    // fallback defaults
+  }
+
+  // Dispatch real mouseWheel events over each detected scrollable container so Douyin's
+  // wheel / IntersectionObserver / virtualized scrollers genuinely paginate to the bottom.
+  for (const pt of parsed.wheelTargets.slice(0, 2)) {
+    await session
+      .send('Input.dispatchMouseEvent', {
+        type: 'mouseMoved',
+        x: pt.x,
+        y: pt.y,
+      })
+      .catch(() => undefined);
+
+    const ticks = nudge ? 4 : 3;
+    for (let t = 0; t < ticks; t += 1) {
+      await session
+        .send('Input.dispatchMouseEvent', {
+          type: 'mouseWheel',
+          x: pt.x,
+          y: pt.y,
+          deltaX: 0,
+          deltaY: 960,
+        })
+        .catch(() => undefined);
+      await sleep(75);
+    }
+  }
+
+  return parsed;
+}
+
+async function fetchNextCursorViaInPageXhr(
+  session: CdpSession,
+  nextPathAndQuery: string,
+): Promise<string | null> {
+  const evalRes = await session
+    .send('Runtime.evaluate', {
+      awaitPromise: true,
+      returnByValue: true,
+      expression: `(async () => {
+        return await new Promise((resolve) => {
+          try {
+            const xhr = new XMLHttpRequest();
+            xhr.open('GET', ${JSON.stringify(nextPathAndQuery)}, true);
+            xhr.withCredentials = true;
+            xhr.timeout = 8500;
+            xhr.onload = () => {
+              resolve(xhr.status >= 200 && xhr.status < 300 ? (xhr.responseText || '') : '');
+            };
+            xhr.onerror = () => resolve('');
+            xhr.ontimeout = () => resolve('');
+            xhr.send();
+          } catch {
+            resolve('');
+          }
+        });
+      })()`,
+    })
+    .catch(() => ({ result: { value: '' } }));
+
+  const text = String((evalRes.result as { value?: string })?.value || '');
+  return text.trim() ? text : null;
+}
+
+async function scrapePageInSession(
+  session: CdpSession,
+  targetUrl: string,
+  options: ScrapeOptions,
+): Promise<PageScrapeResult> {
   const warnings: string[] = [];
   const worksMap = new Map<string, DiscoveredWork>();
+  const mixesMap = new Map<string, DiscoveredMixSummary>();
   let profile: CreatorProfileSummary | undefined;
+  let collectionOwnerSecUid: string | undefined =
+    options.target.expectedSecUid?.trim() || undefined;
+  let collectionOwnerNickname: string | undefined;
+  let expectedCollectionEpisodes: number | undefined;
+  let filteredOtherAuthorCount = 0;
   let emptyBlockedResponses = 0;
   let loginRequired = false;
   let hasMoreRemaining = true;
-  let apiPagesReceived = 0;
-  let lastNewWorkAt = Date.now();
+  let targetApiPagesReceived = 0;
+  let lastTargetApiUrl = '';
+  let lastNextCursor: string | undefined;
+  let olderThanStartDatePages = 0;
+  let active = true;
 
-  const requestUrlMap = new Map<string, { url: string; status: number }>();
+  const requestUrlMap = new Map<
+    string,
+    { url: string; status: number; role: 'target' | 'profile' | 'mix_detail' }
+  >();
+  const inFlightTargetRequestIds = new Set<string>();
   const bodyTasks: Promise<void>[] = [];
 
-  try {
-    await session.send('Network.enable');
-    await session.send('Page.enable');
-    await session.send('Page.addScriptToEvaluateOnNewDocument', {
-      source: `
-        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-        Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-        Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en'] });
-        window.chrome = { runtime: {} };
-      `,
-    });
+  const handleJsonResponse = (
+    apiUrl: string,
+    role: 'target' | 'profile' | 'mix_detail',
+    text: string,
+  ) => {
+    if (!text || !text.trim()) {
+      if (role === 'target') {
+        emptyBlockedResponses += 1;
+      }
+      return;
+    }
 
-    const parsedCookies = parseCookieString(options.cookieString || '');
-    if (parsedCookies.length > 0) {
-      const cdpCookies: Array<Record<string, unknown>> = parsedCookies.flatMap<
-        Record<string, unknown>
-      >((c) => {
-        if (c.name.startsWith('__Host-')) {
-          return [
-            {
-              name: c.name,
-              value: c.value,
-              url: 'https://www.douyin.com',
-              path: '/',
-              secure: true,
-            },
-          ];
+    let data: Record<string, unknown>;
+    try {
+      data = JSON.parse(text) as Record<string, unknown>;
+    } catch {
+      return;
+    }
+
+    const statusCode = Number(data.status_code ?? 0);
+    const statusMsg = String(data.status_msg || '');
+    if (
+      statusCode === 2483 ||
+      statusMsg.includes('请先登录') ||
+      statusMsg.includes('用户未登录')
+    ) {
+      loginRequired = true;
+      return;
+    }
+
+    if (role === 'profile' && data.user && typeof data.user === 'object') {
+      const u = data.user as Record<string, unknown>;
+      const secUid = String(u.sec_uid || options.target.expectedSecUid || '');
+      profile = {
+        nickname: String(u.nickname || ''),
+        secUid,
+        awemeCount: Number(u.aweme_count || 0),
+        favoritingCount: Number(u.favoriting_count || 0),
+      };
+      if (!collectionOwnerSecUid && secUid) {
+        collectionOwnerSecUid = secUid;
+      }
+      if (!collectionOwnerNickname && profile.nickname) {
+        collectionOwnerNickname = profile.nickname;
+      }
+      return;
+    }
+
+    if (role === 'mix_detail') {
+      const mixInfo = (data.mix_info || data.mix_detail) as
+        | {
+            author?: { sec_uid?: string; nickname?: string };
+            statis?: { updated_to_episode?: number; current_episode?: number };
+          }
+        | undefined;
+      if (mixInfo?.author?.sec_uid) {
+        collectionOwnerSecUid = String(mixInfo.author.sec_uid).trim();
+      }
+      if (mixInfo?.author?.nickname) {
+        collectionOwnerNickname = String(mixInfo.author.nickname).trim();
+      }
+      const epCount = Number(
+        mixInfo?.statis?.updated_to_episode || mixInfo?.statis?.current_episode || 0,
+      );
+      if (epCount > 0) {
+        expectedCollectionEpisodes = epCount;
+      }
+      return;
+    }
+
+    if (role !== 'target') return;
+
+    lastTargetApiUrl = apiUrl;
+    const nextCursor = extractNextCursorFromPayload(data, options.target.kind);
+    if (nextCursor) {
+      lastNextCursor = nextCursor;
+    }
+
+    // Handle user_mix_list (/aweme/v1/web/mix/list)
+    if (options.target.kind === 'user_mix_list') {
+      const rawMixes = Array.isArray(data.mix_infos)
+        ? (data.mix_infos as Array<{
+            mix_id?: string | number;
+            mix_name?: string;
+            author?: { sec_uid?: string; nickname?: string };
+            statis?: { updated_to_episode?: number; current_episode?: number };
+          }>)
+        : [];
+      targetApiPagesReceived += 1;
+      hasMoreRemaining = Boolean(data.has_more);
+
+      for (const rawMix of rawMixes) {
+        const mixId = String(rawMix.mix_id || '').trim();
+        if (!mixId) continue;
+        const mixAuthorSecUid = rawMix.author?.sec_uid?.trim();
+        if (
+          options.target.expectedSecUid &&
+          mixAuthorSecUid &&
+          mixAuthorSecUid !== options.target.expectedSecUid
+        ) {
+          continue;
         }
-        const secure = c.name.startsWith('__Secure-') ? true : undefined;
-        return [
-          { ...c, domain: '.douyin.com', ...(secure ? { secure } : {}) },
-          { ...c, domain: '.iesdouyin.com', ...(secure ? { secure } : {}) },
-        ];
-      });
-      try {
-        await session.send('Network.setCookies', { cookies: cdpCookies });
-      } catch {
-        for (const cookie of cdpCookies) {
-          await session.send('Network.setCookie', cookie).catch(() => undefined);
+        if (!mixesMap.has(mixId)) {
+          const epCount = Number(
+            rawMix.statis?.updated_to_episode || rawMix.statis?.current_episode || 0,
+          );
+          mixesMap.set(mixId, {
+            mixId,
+            mixName: (rawMix.mix_name || '').trim() || `合集_${mixId}`,
+            authorSecUid: mixAuthorSecUid,
+            authorNickname: rawMix.author?.nickname?.trim(),
+            expectedEpisodeCount: epCount > 0 ? epCount : undefined,
+          });
+        }
+      }
+      return;
+    }
+
+    let rawItems: RawAweme[] = [];
+    if (Array.isArray(data.aweme_list)) {
+      rawItems = data.aweme_list as RawAweme[];
+      targetApiPagesReceived += 1;
+      hasMoreRemaining = Boolean(data.has_more);
+    } else if (data.aweme_detail && typeof data.aweme_detail === 'object') {
+      rawItems = [data.aweme_detail as RawAweme];
+      targetApiPagesReceived += 1;
+      hasMoreRemaining = false;
+    } else {
+      return;
+    }
+
+    // In collection mode, learn owner sec_uid from mix_info on items if mix/detail hasn't arrived yet
+    if (options.target.kind === 'collection' && !collectionOwnerSecUid) {
+      for (const raw of rawItems) {
+        const mixAuthorSec = raw.mix_info?.author?.sec_uid?.trim();
+        if (mixAuthorSec) {
+          collectionOwnerSecUid = mixAuthorSec;
+          if (!collectionOwnerNickname && raw.mix_info?.author?.nickname) {
+            collectionOwnerNickname = raw.mix_info.author.nickname.trim();
+          }
+          break;
         }
       }
     }
 
-    const handleJsonResponse = (apiUrl: string, text: string) => {
-      if (!text || !text.trim()) {
-        if (
-          apiUrl.includes('/aweme/v1/web/aweme/post') ||
-          apiUrl.includes('/aweme/v1/web/aweme/favorite') ||
-          apiUrl.includes('/aweme/v1/web/mix/aweme') ||
-          apiUrl.includes('/aweme/v1/web/music/aweme')
-        ) {
-          emptyBlockedResponses += 1;
+    let nonPinnedCount = 0;
+    let olderThanStartCount = 0;
+
+    for (const raw of rawItems) {
+      const media = parseAwemeToMedia(raw, options.quality);
+      if (!media) continue;
+
+      const check = shouldAcceptWorkForTarget(
+        raw,
+        media,
+        options.target,
+        collectionOwnerSecUid,
+        collectionOwnerNickname || profile?.nickname,
+      );
+      if (!check.accepted) {
+        if (check.reason === 'other_author') {
+          filteredOtherAuthorCount += 1;
         }
-        return;
+        continue;
       }
 
-      let data: Record<string, unknown>;
-      try {
-        data = JSON.parse(text) as Record<string, unknown>;
-      } catch {
-        return;
-      }
-
-      const statusCode = Number(data.status_code ?? 0);
-      const statusMsg = String(data.status_msg || '');
-      if (
-        statusCode === 2483 ||
-        statusMsg.includes('请先登录') ||
-        statusMsg.includes('用户未登录')
-      ) {
-        loginRequired = true;
-        return;
-      }
-
-      if (apiUrl.includes('/aweme/v1/web/user/profile/other') && data.user) {
-        const u = data.user as Record<string, unknown>;
-        profile = {
-          nickname: String(u.nickname || ''),
-          secUid: String(u.sec_uid || ''),
-          awemeCount: Number(u.aweme_count || 0),
-          favoritingCount: Number(u.favoriting_count || 0),
-        };
-        return;
-      }
-
-      let rawItems: RawAweme[] = [];
-      if (Array.isArray(data.aweme_list)) {
-        rawItems = data.aweme_list as RawAweme[];
-        apiPagesReceived += 1;
-        hasMoreRemaining = Boolean(data.has_more);
-      } else if (data.aweme_detail && typeof data.aweme_detail === 'object') {
-        rawItems = [data.aweme_detail as RawAweme];
-        apiPagesReceived += 1;
-        hasMoreRemaining = false;
-      }
-
-      let addedThisPage = 0;
-      for (const raw of rawItems) {
-        const media = parseAwemeToMedia(raw, options.quality);
-        if (!media) continue;
-        if (!isWithinDateRange(media.publishDate, options.startDate, options.endDate)) {
-          continue;
-        }
-        if (!worksMap.has(media.awemeId)) {
-          worksMap.set(
-            media.awemeId,
-            mediaToDiscoveredWork(media, options.sourceUrl, options.mode),
-          );
-          addedThisPage += 1;
+      if (options.startDate && !raw.is_top) {
+        nonPinnedCount += 1;
+        if (media.publishDate < options.startDate) {
+          olderThanStartCount += 1;
         }
       }
-      if (addedThisPage > 0) {
-        lastNewWorkAt = Date.now();
-      }
-    };
 
-    session.onEvent((method, params) => {
-      if (method === 'Network.responseReceived') {
-        const resp = params.response as { url?: string; status?: number } | undefined;
-        const reqId = String(params.requestId || '');
-        const url = resp?.url || '';
-        if (
-          url.includes('/aweme/v1/web/aweme/post') ||
-          url.includes('/aweme/v1/web/aweme/favorite') ||
-          url.includes('/aweme/v1/web/aweme/detail') ||
-          url.includes('/aweme/v1/web/mix/aweme') ||
-          url.includes('/aweme/v1/web/music/aweme') ||
-          url.includes('/aweme/v1/web/user/profile/other')
-        ) {
-          requestUrlMap.set(reqId, { url, status: Number(resp?.status || 0) });
+      if (!isWithinDateRange(media.publishDate, options.startDate, options.endDate)) {
+        continue;
+      }
+      if (!worksMap.has(media.awemeId)) {
+        worksMap.set(
+          media.awemeId,
+          mediaToDiscoveredWork(media, options.sourceUrl, options.mode),
+        );
+      }
+    }
+
+    if (
+      options.target.kind === 'user_post' &&
+      options.startDate &&
+      nonPinnedCount > 0 &&
+      olderThanStartCount === nonPinnedCount
+    ) {
+      olderThanStartDatePages += 1;
+    } else if (nonPinnedCount > 0) {
+      olderThanStartDatePages = 0;
+    }
+  };
+
+  session.onEvent((method, params) => {
+    if (!active) return;
+
+    if (method === 'Network.requestWillBeSent') {
+      const req = params.request as { url?: string } | undefined;
+      const reqId = String(params.requestId || '');
+      const url = req?.url || '';
+      if (reqId && classifyDouyinApiUrl(url, options.target) === 'target') {
+        inFlightTargetRequestIds.add(reqId);
+      }
+    } else if (method === 'Network.responseReceived') {
+      const resp = params.response as { url?: string; status?: number } | undefined;
+      const reqId = String(params.requestId || '');
+      const url = resp?.url || '';
+      const role = classifyDouyinApiUrl(url, options.target);
+      if (reqId && role !== 'ignore') {
+        requestUrlMap.set(reqId, { url, status: Number(resp?.status || 0), role });
+        if (role === 'target') {
+          inFlightTargetRequestIds.add(reqId);
         }
-      } else if (method === 'Network.loadingFinished') {
-        const reqId = String(params.requestId || '');
-        const meta = requestUrlMap.get(reqId);
-        if (!meta) return;
-        requestUrlMap.delete(reqId);
-        const task = session
-          .send('Network.getResponseBody', { requestId: reqId })
-          .then((res) => {
-            const body = String(res.body || '');
-            const text = res.base64Encoded
-              ? Buffer.from(body, 'base64').toString('utf8')
-              : body;
-            handleJsonResponse(meta.url, text);
-          })
-          .catch(() => {
-            // body evicted or empty
-          });
-        bodyTasks.push(task);
       }
-    });
+    } else if (method === 'Network.loadingFinished') {
+      const reqId = String(params.requestId || '');
+      inFlightTargetRequestIds.delete(reqId);
+      const meta = requestUrlMap.get(reqId);
+      if (!meta) return;
+      requestUrlMap.delete(reqId);
+      const task = session
+        .send('Network.getResponseBody', { requestId: reqId })
+        .then((res) => {
+          const body = String(res.body || '');
+          const text = res.base64Encoded
+            ? Buffer.from(body, 'base64').toString('utf8')
+            : body;
+          handleJsonResponse(meta.url, meta.role, text);
+        })
+        .catch(() => {
+          // body evicted or empty
+        });
+      bodyTasks.push(task);
+    } else if (method === 'Network.loadingFailed') {
+      const reqId = String(params.requestId || '');
+      inFlightTargetRequestIds.delete(reqId);
+      requestUrlMap.delete(reqId);
+    }
+  });
 
+  const flushBodyTasks = async () => {
+    if (bodyTasks.length > 0) {
+      await Promise.allSettled(bodyTasks.splice(0, bodyTasks.length));
+    }
+  };
+
+  const tabToClick =
+    options.target.kind === 'user_like'
+      ? '喜欢'
+      : options.target.kind === 'user_mix_list'
+        ? '合集'
+        : options.target.kind === 'user_collect'
+          ? '收藏'
+          : null;
+
+  try {
     await session.send('Page.navigate', { url: targetUrl });
 
-    // Wait for initial JS hydration + first API page
+    if (tabToClick) {
+      // Wait for user homepage tabs/profile to hydrate before clicking the target tab
+      const hydrateDeadline = Date.now() + 6_000;
+      let clicked = false;
+      while (Date.now() < hydrateDeadline) {
+        await sleep(300);
+        await flushBodyTasks();
+        if (loginRequired || targetApiPagesReceived > 0) {
+          clicked = true;
+          break;
+        }
+        await dismissBlockingModals(session);
+        clicked = await clickUserHomepageTab(session, tabToClick);
+        if (clicked) break;
+      }
+      if (!clicked && !loginRequired && targetApiPagesReceived === 0) {
+        await dismissBlockingModals(session);
+        await clickUserHomepageTab(session, tabToClick);
+      }
+    }
+
+    // Wait for initial JS hydration + first target API page
     const initDeadline = Date.now() + 12_000;
+    const initStart = Date.now();
     while (Date.now() < initDeadline) {
-      await new Promise((r) => setTimeout(r, 500));
+      await sleep(200);
+      await flushBodyTasks();
       if (
-        worksMap.size > 0 ||
+        targetApiPagesReceived > 0 ||
         loginRequired ||
-        (emptyBlockedResponses > 0 && Date.now() - lastNewWorkAt > 4000)
+        (emptyBlockedResponses > 0 && Date.now() - initStart > 3500)
       ) {
         break;
       }
     }
 
-    // Dismiss any login modal if present
-    await session
-      .send('Runtime.evaluate', {
-        expression: `(() => {
-          const selectors = ['.dy-account-close', '[class*="login"] [class*="close"]', '[aria-label*="关闭"]'];
-          for (const sel of selectors) {
-            const el = document.querySelector(sel);
-            if (el && el.click) el.click();
-          }
-        })()`,
-      })
-      .catch(() => undefined);
+    await dismissBlockingModals(session);
+
+    const collectedCount = () =>
+      options.target.kind === 'user_mix_list' ? mixesMap.size : worksMap.size;
 
     if (options.paginate && !loginRequired) {
-      // If mode is 'like' or 'mix' on a user homepage, try clicking the matching tab
-      if (options.mode === 'like' || options.mode === 'mix') {
-        const tabLabel = options.mode === 'like' ? '喜欢' : '合集';
-        await session
-          .send('Runtime.evaluate', {
-            expression: `(() => {
-              const tabs = Array.from(document.querySelectorAll('[role="tab"], [data-e2e*="tab"], div, span'));
-              const match = tabs.find(el => el.childElementCount === 0 && (el.textContent || '').trim().startsWith('${tabLabel}'));
-              if (match && match.click) match.click();
-            })()`,
-          })
-          .catch(() => undefined);
-        await new Promise((r) => setTimeout(r, 1500));
-      }
-
-      const crawlDeadline = Date.now() + 35_000;
+      const crawlDeadline = Date.now() + MAX_CRAWL_DURATION_MS;
       let idleRounds = 0;
       let scrollCount = 0;
-      const maxScrolls = 35;
+      let prevMaxScrollHeight = 0;
+      let xhrFallbackFailed = false;
+      let usingXhrContinuation = false;
+      const triedCursors = new Set<string>();
 
-      while (Date.now() < crawlDeadline && scrollCount < maxScrolls) {
+      while (Date.now() < crawlDeadline && scrollCount < MAX_SCROLL_ROUNDS) {
+        await flushBodyTasks();
+
         if (loginRequired) break;
-        if (options.maxItems > 0 && worksMap.size >= options.maxItems) break;
-        if (apiPagesReceived > 0 && !hasMoreRemaining) break;
-        if (worksMap.size === 0 && emptyBlockedResponses >= 2) break;
+        if (
+          options.target.kind !== 'user_mix_list' &&
+          options.maxItems > 0 &&
+          worksMap.size >= options.maxItems
+        ) {
+          break;
+        }
+        if (
+          targetApiPagesReceived > 0 &&
+          !hasMoreRemaining &&
+          inFlightTargetRequestIds.size === 0
+        ) {
+          break;
+        }
+        if (olderThanStartDatePages >= 2 && inFlightTargetRequestIds.size === 0) {
+          break;
+        }
+        if (collectedCount() === 0 && emptyBlockedResponses >= 3) {
+          break;
+        }
 
-        const beforeCount = worksMap.size;
-        await session
-          .send('Runtime.evaluate', {
-            expression: `(() => {
-              window.scrollTo(0, document.body.scrollHeight);
-              const scroller = document.querySelector('#douyin-right-container, [data-e2e="user-post-list"]')?.parentElement;
-              if (scroller) scroller.scrollTop = scroller.scrollHeight;
-            })()`,
-          })
-          .catch(() => undefined);
+        const beforePages = targetApiPagesReceived;
+        const beforeCount = collectedCount();
+        const shouldNudge = idleRounds >= 2;
 
+        if (shouldNudge) {
+          await dismissBlockingModals(session);
+        }
+
+        const scrollRes = await performMouseAndContainerScroll(
+          session,
+          options.target.kind,
+          shouldNudge,
+        );
         scrollCount += 1;
-        await new Promise((r) => setTimeout(r, 1250));
-        await Promise.allSettled(bodyTasks.splice(0, bodyTasks.length));
 
-        if (worksMap.size === beforeCount) {
-          idleRounds += 1;
-          if (idleRounds >= 4) break;
-        } else {
+        // Event-driven wait: resume promptly once a new target page arrives and settles,
+        // or wait longer if a target API request is actively in-flight.
+        const minWaitUntil = Date.now() + 350;
+        const normalWaitDeadline = Date.now() + 1_500;
+        const inFlightWaitDeadline = Date.now() + 3_500;
+
+        while (Date.now() < inFlightWaitDeadline) {
+          await sleep(100);
+          await flushBodyTasks();
+
+          const gotNewPage =
+            targetApiPagesReceived > beforePages || collectedCount() > beforeCount;
+          if (gotNewPage && inFlightTargetRequestIds.size === 0) {
+            // Brief settle so DOM renders the newly appended cards before the next scroll
+            await sleep(150);
+            await flushBodyTasks();
+            break;
+          }
+          if (loginRequired) break;
+          if (
+            targetApiPagesReceived > 0 &&
+            !hasMoreRemaining &&
+            inFlightTargetRequestIds.size === 0
+          ) {
+            break;
+          }
+          if (
+            Date.now() >= normalWaitDeadline &&
+            inFlightTargetRequestIds.size === 0
+          ) {
+            break;
+          }
+          if (Date.now() >= minWaitUntil && scrollRes.reachedBottomText && inFlightTargetRequestIds.size === 0 && targetApiPagesReceived > 0 && !hasMoreRemaining) {
+            break;
+          }
+        }
+
+        const pageAdvanced =
+          targetApiPagesReceived > beforePages || collectedCount() > beforeCount;
+        const heightExpanded = scrollRes.maxScrollHeight > prevMaxScrollHeight + 24;
+        if (scrollRes.maxScrollHeight > prevMaxScrollHeight) {
+          prevMaxScrollHeight = scrollRes.maxScrollHeight;
+        }
+
+        if (pageAdvanced) {
           idleRounds = 0;
+        } else if (heightExpanded || scrollRes.isLoading) {
+          // Container is still expanding or showing a loading spinner; be patient
+          idleRounds = Math.min(idleRounds + 1, Math.max(1, MAX_IDLE_ROUNDS - 3));
+        } else {
+          idleRounds += 1;
+        }
+
+        // If DOM scrolling stalled while the API still reports has_more=true and we have a cursor,
+        // try in-page XHR continuation (signed by Douyin's own in-page bdms/webmssdk hook).
+        const xhrTriggerRounds = usingXhrContinuation ? 1 : 3;
+        if (
+          !pageAdvanced &&
+          idleRounds >= xhrTriggerRounds &&
+          !xhrFallbackFailed &&
+          hasMoreRemaining &&
+          lastTargetApiUrl &&
+          lastNextCursor &&
+          !triedCursors.has(lastNextCursor) &&
+          inFlightTargetRequestIds.size === 0
+        ) {
+          const cursorToTry = lastNextCursor;
+          triedCursors.add(cursorToTry);
+          const nextPath = buildNextCursorApiUrl(
+            lastTargetApiUrl,
+            getCursorParamName(options.target.kind),
+            cursorToTry,
+          );
+          if (nextPath) {
+            const pagesBeforeXhr = targetApiPagesReceived;
+            const xhrText = await fetchNextCursorViaInPageXhr(session, nextPath);
+            await sleep(150);
+            await flushBodyTasks();
+
+            if (xhrText && targetApiPagesReceived === pagesBeforeXhr) {
+              handleJsonResponse(
+                `https://www.douyin.com${nextPath}`,
+                'target',
+                xhrText,
+              );
+            }
+
+            if (targetApiPagesReceived > pagesBeforeXhr) {
+              usingXhrContinuation = true;
+              idleRounds = 0;
+              await sleep(450);
+              continue;
+            } else {
+              xhrFallbackFailed = true;
+            }
+          }
+        }
+
+        if (
+          scrollRes.reachedBottomText &&
+          targetApiPagesReceived > 0 &&
+          inFlightTargetRequestIds.size === 0 &&
+          idleRounds >= 3
+        ) {
+          break;
+        }
+
+        if (idleRounds >= MAX_IDLE_ROUNDS) {
+          break;
         }
       }
     }
 
-    await Promise.allSettled(bodyTasks);
+    await flushBodyTasks();
 
-    // Secondary DOM safety net: if API was empty/truncated, check visible DOM /video/ and /note/ links
-    if (worksMap.size === 0) {
+    // DOM fallback for user_mix_list: pick up any /collection/<id> links rendered on the 合集 tab
+    if (options.target.kind === 'user_mix_list' && mixesMap.size === 0) {
+      const domMixRes = await session
+        .send('Runtime.evaluate', {
+          returnByValue: true,
+          expression: `JSON.stringify(
+            Array.from(
+              document.querySelectorAll(
+                '[data-e2e="user-mix-list"] a[href*="/collection/"], #douyin-right-container a[href*="/collection/"], a[href*="/mix/detail/"]'
+              )
+            ).map((a) => ({
+              href: a.getAttribute('href') || '',
+              title: (a.textContent || '').trim()
+            }))
+          )`,
+        })
+        .catch(() => ({ result: { value: '[]' } }));
+
+      let mixLinks: Array<{ href?: string; title?: string }> = [];
+      try {
+        mixLinks = JSON.parse(
+          String((domMixRes.result as { value?: string })?.value || '[]'),
+        );
+      } catch {
+        mixLinks = [];
+      }
+
+      for (const item of mixLinks) {
+        const mixId = item.href?.match(/\/(?:collection|mix\/detail)\/(\d+)/)?.[1];
+        if (mixId && !mixesMap.has(mixId)) {
+          mixesMap.set(mixId, {
+            mixId,
+            mixName: item.title || `合集_${mixId}`,
+            authorSecUid: options.target.expectedSecUid,
+          });
+        }
+      }
+    }
+
+    // Secondary DOM safety net for works: scoped to the primary content container,
+    // and strictly filtered by target author / awemeId.
+    if (options.target.kind !== 'user_mix_list' && worksMap.size === 0) {
+      const domSelector =
+        options.target.kind === 'user_post'
+          ? '[data-e2e="user-post-list"] a[href*="/video/"], [data-e2e="user-post-list"] a[href*="/note/"], #douyin-right-container a[href*="/video/"], #douyin-right-container a[href*="/note/"]'
+          : options.target.kind === 'collection'
+            ? '[data-e2e*="mix"] a[href*="/video/"], [data-e2e*="collection"] a[href*="/video/"], [class*="mix"] a[href*="/video/"], #douyin-right-container a[href*="/video/"]'
+            : '#douyin-right-container a[href*="/video/"], #douyin-right-container a[href*="/note/"], a[href*="/video/"], a[href*="/note/"]';
+
       const domRes = await session
         .send('Runtime.evaluate', {
           returnByValue: true,
           expression: `JSON.stringify(
-            Array.from(document.querySelectorAll('a[href*="/video/"], a[href*="/note/"]'))
+            Array.from(document.querySelectorAll(${JSON.stringify(domSelector)}))
               .map(a => a.getAttribute('href') || '')
               .filter(Boolean)
           )`,
@@ -815,14 +1817,32 @@ async function scrapePageViaChromium(
             .filter((id): id is string => Boolean(id)),
         ),
       );
-      const cap = options.maxItems > 0 ? Math.min(ids.length, options.maxItems) : Math.min(ids.length, 30);
+      const cap =
+        options.maxItems > 0 ? Math.min(ids.length, options.maxItems) : Math.min(ids.length, 30);
       for (const awemeId of ids.slice(0, cap)) {
+        if (options.target.kind === 'single' && options.target.expectedAwemeId && awemeId !== options.target.expectedAwemeId) {
+          continue;
+        }
         const media = await fetchSingleAwemeBySharePage(
           awemeId,
           options.quality,
           options.cookieString,
         );
-        if (media && isWithinDateRange(media.publishDate, options.startDate, options.endDate)) {
+        if (!media) continue;
+        const check = shouldAcceptWorkForTarget(
+          null,
+          media,
+          options.target,
+          collectionOwnerSecUid,
+          collectionOwnerNickname || profile?.nickname,
+        );
+        if (!check.accepted) {
+          if (check.reason === 'other_author') {
+            filteredOtherAuthorCount += 1;
+          }
+          continue;
+        }
+        if (isWithinDateRange(media.publishDate, options.startDate, options.endDate)) {
           worksMap.set(
             media.awemeId,
             mediaToDiscoveredWork(media, options.sourceUrl, options.mode),
@@ -832,16 +1852,157 @@ async function scrapePageViaChromium(
     }
 
     let finalWorks = Array.from(worksMap.values());
+
+    // Final author consistency pass (handles cases where collection owner sec_uid arrived
+    // via mix/detail after page 1 of mix/aweme, or falls back to the dominant author in a collection).
+    if (options.target.strictAuthorFilter && finalWorks.length > 0) {
+      const effectiveOwnerSecUid =
+        collectionOwnerSecUid ||
+        options.target.expectedSecUid ||
+        (options.target.kind === 'collection'
+          ? resolveDominantAuthorSecUid(finalWorks)
+          : undefined);
+      const effectiveOwnerNickname = collectionOwnerNickname || profile?.nickname;
+
+      if (effectiveOwnerSecUid) {
+        collectionOwnerSecUid = effectiveOwnerSecUid;
+        const beforeFilter = finalWorks.length;
+        finalWorks = finalWorks.filter((work) => {
+          if (work.authorId) {
+            return work.authorId === effectiveOwnerSecUid;
+          }
+          if (effectiveOwnerNickname) {
+            return work.author === effectiveOwnerNickname;
+          }
+          return false;
+        });
+        filteredOtherAuthorCount += beforeFilter - finalWorks.length;
+      }
+    }
+
     if (options.maxItems > 0 && finalWorks.length > options.maxItems) {
       finalWorks = finalWorks.slice(0, options.maxItems);
     }
 
     return {
       works: finalWorks,
+      mixes: Array.from(mixesMap.values()),
       profile,
+      collectionOwnerSecUid,
+      collectionOwnerNickname,
+      expectedCollectionEpisodes,
+      filteredOtherAuthorCount,
       emptyBlockedResponses,
       loginRequired,
       hasMoreRemaining,
+      warnings,
+    };
+  } finally {
+    active = false;
+  }
+}
+
+async function scrapePageViaChromium(
+  targetUrl: string,
+  options: ScrapeOptions,
+): Promise<PageScrapeResult> {
+  const session = await openCdpSession();
+  try {
+    await prepareCdpSession(session, options.cookieString);
+    return await scrapePageInSession(session, targetUrl, options);
+  } finally {
+    session.close();
+  }
+}
+
+async function scrapeUserMixesViaChromium(
+  secUid: string,
+  settings: BatchSettings,
+  sourceUrl: string,
+): Promise<PageScrapeResult> {
+  const session = await openCdpSession();
+  try {
+    await prepareCdpSession(session, settings.cookieString);
+
+    const mixListRes = await scrapePageInSession(
+      session,
+      `https://www.douyin.com/user/${encodeURIComponent(secUid)}`,
+      {
+        quality: settings.videoQuality,
+        cookieString: settings.cookieString,
+        mode: 'mix',
+        maxItems: 0,
+        startDate: settings.startDate,
+        endDate: settings.endDate,
+        sourceUrl,
+        paginate: true,
+        target: {
+          kind: 'user_mix_list',
+          expectedSecUid: secUid,
+          strictAuthorFilter: true,
+        },
+      },
+    );
+
+    const worksMap = new Map<string, DiscoveredWork>();
+    let filteredOtherAuthorCount = mixListRes.filteredOtherAuthorCount;
+    let emptyBlockedResponses = mixListRes.emptyBlockedResponses;
+    let loginRequired = mixListRes.loginRequired;
+    const warnings = [...mixListRes.warnings];
+
+    for (const mix of mixListRes.mixes) {
+      if (settings.maxItemsPerMode > 0 && worksMap.size >= settings.maxItemsPerMode) {
+        break;
+      }
+      const remaining =
+        settings.maxItemsPerMode > 0
+          ? Math.max(1, settings.maxItemsPerMode - worksMap.size)
+          : 0;
+      const collectionUrl = `https://www.douyin.com/collection/${encodeURIComponent(mix.mixId)}`;
+      const colRes = await scrapePageInSession(session, collectionUrl, {
+        quality: settings.videoQuality,
+        cookieString: settings.cookieString,
+        mode: 'mix',
+        maxItems: remaining,
+        startDate: settings.startDate,
+        endDate: settings.endDate,
+        sourceUrl: collectionUrl,
+        paginate: true,
+        target: {
+          kind: 'collection',
+          expectedMixId: mix.mixId,
+          expectedSecUid: secUid,
+          strictAuthorFilter: true,
+        },
+      });
+
+      filteredOtherAuthorCount += colRes.filteredOtherAuthorCount;
+      emptyBlockedResponses += colRes.emptyBlockedResponses;
+      if (colRes.loginRequired) loginRequired = true;
+      warnings.push(...colRes.warnings);
+
+      for (const work of colRes.works) {
+        if (!worksMap.has(work.awemeId)) {
+          worksMap.set(work.awemeId, work);
+        }
+      }
+    }
+
+    let finalWorks = Array.from(worksMap.values());
+    if (settings.maxItemsPerMode > 0 && finalWorks.length > settings.maxItemsPerMode) {
+      finalWorks = finalWorks.slice(0, settings.maxItemsPerMode);
+    }
+
+    return {
+      works: finalWorks,
+      mixes: mixListRes.mixes,
+      profile: mixListRes.profile,
+      collectionOwnerSecUid: secUid,
+      collectionOwnerNickname: mixListRes.profile?.nickname,
+      filteredOtherAuthorCount,
+      emptyBlockedResponses,
+      loginRequired,
+      hasMoreRemaining: false,
       warnings,
     };
   } finally {
@@ -877,7 +2038,7 @@ export async function discoverWorksForLink(
       settings.cookieString,
       link.type === 'gallery',
     );
-    if (shareMedia) {
+    if (shareMedia && shareMedia.awemeId === awemeId) {
       return {
         works: [mediaToDiscoveredWork(shareMedia, targetDesktopUrl, 'post')],
         warnings: [],
@@ -891,6 +2052,11 @@ export async function discoverWorksForLink(
       maxItems: 1,
       sourceUrl: targetDesktopUrl,
       paginate: false,
+      target: {
+        kind: 'single',
+        expectedAwemeId: awemeId,
+        strictAuthorFilter: false,
+      },
     });
     if (cdpRes.works.length === 0) {
       warnings.push(
@@ -916,27 +2082,46 @@ export async function discoverWorksForLink(
     const allWorks = new Map<string, DiscoveredWork>();
     let finalProfile = quickProfile || undefined;
     let requiresCookie = false;
+    let totalFilteredOtherAuthor = 0;
 
     for (const mode of activeModes) {
-      const cdpRes = await scrapePageViaChromium(
-        `https://www.douyin.com/user/${encodeURIComponent(secUid)}`,
-        {
-          quality: settings.videoQuality,
-          cookieString: settings.cookieString,
-          mode,
-          maxItems: settings.maxItemsPerMode,
-          startDate: settings.startDate,
-          endDate: settings.endDate,
-          sourceUrl: resolvedUrl,
-          paginate: true,
-        },
-      );
+      let cdpRes: PageScrapeResult;
+      if (mode === 'mix') {
+        cdpRes = await scrapeUserMixesViaChromium(secUid, settings, resolvedUrl);
+      } else {
+        const targetKind: ScrapeTargetKind =
+          mode === 'like'
+            ? 'user_like'
+            : mode === 'collect'
+              ? 'user_collect'
+              : 'user_post';
+        cdpRes = await scrapePageViaChromium(
+          `https://www.douyin.com/user/${encodeURIComponent(secUid)}`,
+          {
+            quality: settings.videoQuality,
+            cookieString: settings.cookieString,
+            mode,
+            maxItems: settings.maxItemsPerMode,
+            startDate: settings.startDate,
+            endDate: settings.endDate,
+            sourceUrl: resolvedUrl,
+            paginate: true,
+            target: {
+              kind: targetKind,
+              expectedSecUid: secUid,
+              strictAuthorFilter: targetKind === 'user_post',
+            },
+          },
+        );
+      }
+
       if (cdpRes.profile && cdpRes.profile.nickname) {
         finalProfile = cdpRes.profile;
       }
       if (cdpRes.loginRequired || cdpRes.emptyBlockedResponses > 0) {
         requiresCookie = true;
       }
+      totalFilteredOtherAuthor += cdpRes.filteredOtherAuthorCount;
       for (const w of cdpRes.works) {
         if (!allWorks.has(w.awemeId)) {
           allWorks.set(w.awemeId, w);
@@ -960,9 +2145,18 @@ export async function discoverWorksForLink(
           `未能从博主「${authorLabel}」主页获取到作品，请检查 Cookie 是否已过期、账号是否设为私密，或稍后重试。`,
         );
       }
-    } else if (totalExpected > 0 && works.length < totalExpected && settings.maxItemsPerMode === 0) {
+    } else if (
+      activeModes.includes('post') &&
+      totalExpected > 0 &&
+      works.length < totalExpected &&
+      settings.maxItemsPerMode === 0
+    ) {
+      const filterNote =
+        totalFilteredOtherAuthor > 0
+          ? `（已自动过滤 ${totalFilteredOtherAuthor} 个非该作者/共创作品）`
+          : '';
       warnings.push(
-        `博主「${authorLabel}」主页标称 ${totalExpected} 个作品，本次共解析到 ${works.length} 个（视频 ${videoCount} / 图文 ${galleryCount}）。部分作品可能因日期筛选、私密状态或风控分页上限未返回。`,
+        `博主「${authorLabel}」主页标称 ${totalExpected} 个作品，本次共解析到 ${works.length} 个（视频 ${videoCount} / 图文 ${galleryCount}）${filterNote}。部分作品可能因日期筛选、私密/仅互关状态或风控分页上限未返回。`,
       );
     }
 
@@ -977,19 +2171,44 @@ export async function discoverWorksForLink(
   if (link.type === 'collection' || link.type === 'music') {
     const targetDesktopUrl =
       buildCanonicalDouyinUrl(link.type, link.targetId) || resolvedUrl;
+    const isCollection = link.type === 'collection';
     const cdpRes = await scrapePageViaChromium(targetDesktopUrl, {
       quality: settings.videoQuality,
       cookieString: settings.cookieString,
-      mode: link.type === 'collection' ? 'mix' : 'music',
+      mode: isCollection ? 'mix' : 'music',
       maxItems: settings.maxItemsPerMode,
       startDate: settings.startDate,
       endDate: settings.endDate,
       sourceUrl: targetDesktopUrl,
       paginate: true,
+      target: isCollection
+        ? {
+            kind: 'collection',
+            expectedMixId: link.targetId,
+            strictAuthorFilter: true,
+          }
+        : {
+            kind: 'music',
+            expectedMusicId: link.targetId,
+            strictAuthorFilter: false,
+          },
     });
     if (cdpRes.works.length === 0) {
       warnings.push(
         `未能从该${link.label}解析到作品列表，请确认已在配置中填入有效抖音 Cookie 后重试。`,
+      );
+    } else if (
+      isCollection &&
+      cdpRes.expectedCollectionEpisodes &&
+      cdpRes.works.length < cdpRes.expectedCollectionEpisodes &&
+      settings.maxItemsPerMode === 0
+    ) {
+      const filterNote =
+        cdpRes.filteredOtherAuthorCount > 0
+          ? `（已自动过滤 ${cdpRes.filteredOtherAuthorCount} 个非合集作者作品）`
+          : '';
+      warnings.push(
+        `该合集标称 ${cdpRes.expectedCollectionEpisodes} 集，本次共解析到 ${cdpRes.works.length} 个作品${filterNote}。部分剧集可能因日期筛选、下架或私密状态未返回。`,
       );
     }
     return {

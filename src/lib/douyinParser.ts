@@ -46,9 +46,19 @@ export interface RawAweme {
   aweme_type?: number;
   desc?: string;
   create_time?: number;
+  is_top?: number | boolean;
+  mix_info?: {
+    mix_id?: string | number;
+    mix_name?: string;
+    author?: {
+      nickname?: string;
+      sec_uid?: string;
+    };
+  };
   author?: {
     nickname?: string;
     sec_uid?: string;
+    uid?: string;
     avatar_larger?: RawUrlAddr;
     avatar_thumb?: RawUrlAddr;
   };
