@@ -9,6 +9,7 @@ export interface ParsedAwemeMedia {
   publishTs: number;
   mediaType: DouyinUrlType;
   videoUrl?: string;
+  videoUri?: string;
   imageUrls: string[];
   coverUrl?: string;
   musicUrl?: string;
@@ -23,22 +24,49 @@ export interface ParsedAwemeMedia {
 
 interface RawUrlAddr {
   url_list?: string[];
+  urlList?: string[];
+  uri?: string;
   data_size?: number;
   width?: number;
   height?: number;
+  w?: number;
+  h?: number;
 }
 
 interface RawBitRate {
   bit_rate?: number;
   gear_name?: string;
   quality_type?: number;
+  width?: number;
+  height?: number;
+  is_h265?: number;
+  is_bytevc1?: number;
   play_addr?: RawUrlAddr;
+  play_addr_h264?: RawUrlAddr;
+  play_addr_265?: RawUrlAddr;
+  play_addr_bytevc1?: RawUrlAddr;
 }
 
 interface RawImageItem {
+  watermark_free_download_url_list?: string[];
+  origin_image?: RawUrlAddr;
+  display_image?: RawUrlAddr;
   url_list?: string[];
+  urlList?: string[];
+  download_url?: RawUrlAddr | string;
+  download_addr?: RawUrlAddr;
   download_url_list?: string[];
-  video?: { play_addr?: RawUrlAddr };
+  owner_watermark_image?: RawUrlAddr;
+  width?: number;
+  height?: number;
+  w?: number;
+  h?: number;
+  video?: {
+    play_addr?: RawUrlAddr;
+    play_addr_h264?: RawUrlAddr;
+    play_addr_265?: RawUrlAddr;
+    bit_rate?: RawBitRate[];
+  };
 }
 
 export interface RawAweme {
@@ -63,16 +91,27 @@ export interface RawAweme {
     avatar_thumb?: RawUrlAddr;
   };
   video?: {
+    vid?: string;
     play_addr?: RawUrlAddr;
+    play_addr_h264?: RawUrlAddr;
+    play_addr_265?: RawUrlAddr;
+    play_addr_256?: RawUrlAddr;
+    play_addr_bytevc1?: RawUrlAddr;
     download_addr?: RawUrlAddr;
     cover?: RawUrlAddr;
     origin_cover?: RawUrlAddr;
+    cover_original_scale?: RawUrlAddr;
     dynamic_cover?: RawUrlAddr;
     bit_rate?: RawBitRate[];
     width?: number;
     height?: number;
   };
+  image_post_info?: {
+    images?: RawImageItem[] | null;
+    image_list?: RawImageItem[] | null;
+  };
   images?: RawImageItem[] | null;
+  image_list?: RawImageItem[] | null;
   image_infos?: RawImageItem[] | null;
   music?: {
     play_url?: RawUrlAddr;
@@ -91,84 +130,447 @@ const TARGET_HEIGHT_BY_QUALITY: Partial<Record<VideoQuality, number>> = {
   '540p': 540,
 };
 
+const STANDARD_LONG_EDGE_TO_SHORT_EDGE: Array<[number, number]> = [
+  [3840, 2160],
+  [2560, 1440],
+  [1920, 1080],
+  [1280, 720],
+  [960, 540],
+  [854, 480],
+  [640, 360],
+];
+
+const WATERMARK_URL_HINTS = [
+  'tplv-dy-water',
+  'dy-water',
+  'owner_watermark',
+  'watermark_image',
+  'watermark=1',
+  'playwm',
+];
+
+export function isWatermarkedMediaUrl(url: string): boolean {
+  const lower = (url || '').toLowerCase();
+  return WATERMARK_URL_HINTS.some((hint) => lower.includes(hint));
+}
+
 export function toWatermarkFreeUrl(url: string): string {
   return url.replace('/playwm/', '/play/').replace(/^http:\/\//i, 'https://');
 }
 
-function firstValidUrl(urls?: string[]): string | undefined {
-  if (!Array.isArray(urls)) return undefined;
-  for (const raw of urls) {
-    if (typeof raw === 'string' && raw.startsWith('http')) {
-      return toWatermarkFreeUrl(raw);
+function upgradePlayEndpointRatio(url: string, quality: VideoQuality): string {
+  if (!url.includes('/aweme/v1/play/')) return url;
+  try {
+    const parsed = new URL(url);
+    const currentRatio = (parsed.searchParams.get('ratio') || '').toLowerCase();
+    if (!currentRatio) return url;
+
+    const currentNum = Number(currentRatio.replace(/p$/i, '')) || 0;
+    if (quality === 'highest' || quality === 'original' || quality === '1080p') {
+      if (currentNum > 0 && currentNum < 1080) {
+        parsed.searchParams.set('ratio', '1080p');
+        return parsed.toString();
+      }
+    } else if (quality === '1440p') {
+      if (currentNum > 0 && currentNum < 1440) {
+        parsed.searchParams.set('ratio', '1440p');
+        return parsed.toString();
+      }
     }
+  } catch {
+    // ignore malformed URLs
   }
-  return undefined;
+  return url;
+}
+
+function extractUrlStrings(source?: RawUrlAddr | string[] | string | null): string[] {
+  if (!source) return [];
+  if (typeof source === 'string') {
+    return source.startsWith('http') ? [source] : [];
+  }
+  if (Array.isArray(source)) {
+    return source.filter((u): u is string => typeof u === 'string' && u.startsWith('http'));
+  }
+  const rawList = Array.isArray(source.url_list)
+    ? source.url_list
+    : Array.isArray(source.urlList)
+      ? source.urlList
+      : [];
+  return rawList.filter((u): u is string => typeof u === 'string' && u.startsWith('http'));
+}
+
+function pickBestPlayUrlFromList(
+  urls?: string[],
+  quality?: VideoQuality,
+): string | undefined {
+  if (!Array.isArray(urls) || urls.length === 0) return undefined;
+  const valid = urls.filter((u): u is string => typeof u === 'string' && u.startsWith('http'));
+  if (valid.length === 0) return undefined;
+
+  // Prefer direct watermark-free CDN URLs (e.g. douyinvod.com) over /aweme/v1/play/ redirect
+  // endpoints or /playwm/ watermarked endpoints.
+  const scored = valid.map((raw, idx) => {
+    const lower = raw.toLowerCase();
+    const isPlayWm = lower.includes('/playwm/');
+    const isPlayRedirect = lower.includes('/aweme/v1/play');
+    const score = (isPlayWm ? 20 : 0) + (isPlayRedirect ? 10 : 0);
+    return { raw, score, idx };
+  });
+  scored.sort((a, b) => a.score - b.score || a.idx - b.idx);
+  const cleaned = toWatermarkFreeUrl(scored[0].raw);
+  return quality ? upgradePlayEndpointRatio(cleaned, quality) : cleaned;
+}
+
+function firstValidUrl(urls?: string[]): string | undefined {
+  return pickBestPlayUrlFromList(urls);
+}
+
+function parseGearNameShortEdge(gearName?: string): number {
+  if (!gearName) return 0;
+  const lower = gearName.toLowerCase();
+  if (lower.includes('4k') || lower.includes('2160')) return 2160;
+  if (lower.includes('2k') || lower.includes('1440')) return 1440;
+  if (lower.includes('1080')) return 1080;
+  if (lower.includes('720')) return 720;
+  if (lower.includes('540')) return 540;
+  if (lower.includes('480')) return 480;
+  if (lower.includes('360')) return 360;
+  return 0;
+}
+
+function computeTrackResolution(
+  entry: { width?: number; height?: number; gear_name?: string },
+  playAddr?: RawUrlAddr,
+): { width: number; height: number; shortEdge: number; pixels: number } {
+  const width = Math.max(0, Math.round(Number(playAddr?.width || entry.width || 0) || 0));
+  const height = Math.max(0, Math.round(Number(playAddr?.height || entry.height || 0) || 0));
+
+  if (width > 0 && height > 0) {
+    return {
+      width,
+      height,
+      shortEdge: Math.min(width, height),
+      pixels: width * height,
+    };
+  }
+
+  const singleEdge = Math.max(width, height);
+  if (singleEdge > 0) {
+    let bestShort = 0;
+    let bestDiff = Infinity;
+    for (const [longStd, shortStd] of STANDARD_LONG_EDGE_TO_SHORT_EDGE) {
+      const diff = Math.abs(longStd - singleEdge);
+      if (diff < bestDiff) {
+        bestDiff = diff;
+        bestShort = shortStd;
+      }
+    }
+    return {
+      width,
+      height,
+      shortEdge: bestShort,
+      pixels: singleEdge * bestShort,
+    };
+  }
+
+  const gearShort = parseGearNameShortEdge(entry.gear_name);
+  if (gearShort > 0) {
+    const estLong = Math.round((gearShort * 16) / 9);
+    return {
+      width: 0,
+      height: 0,
+      shortEdge: gearShort,
+      pixels: gearShort * estLong,
+    };
+  }
+
+  return { width: 0, height: 0, shortEdge: 0, pixels: 0 };
+}
+
+interface NormalizedVideoCandidate {
+  url: string;
+  uri?: string;
+  bitRate: number;
+  dataSize: number;
+  width: number;
+  height: number;
+  shortEdge: number;
+  pixels: number;
 }
 
 export function pickBestVideoMedia(
   aweme: RawAweme,
   quality: VideoQuality,
-): { url?: string; sizeBytes: number; width?: number; height?: number } {
-  const bitRates = Array.isArray(aweme.video?.bit_rate)
-    ? aweme.video!.bit_rate!.filter((b) => Boolean(firstValidUrl(b.play_addr?.url_list)))
-    : [];
+): { url?: string; uri?: string; sizeBytes: number; width?: number; height?: number } {
+  const video = aweme.video;
+  const candidates: NormalizedVideoCandidate[] = [];
+  const seenUrls = new Set<string>();
 
-  if (bitRates.length > 0) {
-    const sorted = [...bitRates].sort((a, b) => {
-      const sizeA = a.play_addr?.data_size || a.bit_rate || 0;
-      const sizeB = b.play_addr?.data_size || b.bit_rate || 0;
-      return sizeB - sizeA;
+  const pushCandidate = (
+    addr: RawUrlAddr | undefined,
+    meta: { bitRate?: number; width?: number; height?: number; gear_name?: string } = {},
+  ) => {
+    if (!addr) return;
+    const url = pickBestPlayUrlFromList(extractUrlStrings(addr), quality);
+    if (!url || seenUrls.has(url)) return;
+    seenUrls.add(url);
+    const res = computeTrackResolution(meta, addr);
+    candidates.push({
+      url,
+      uri: addr.uri || video?.vid,
+      bitRate: Math.max(0, Number(meta.bitRate || 0) || 0),
+      dataSize: Math.max(0, Number(addr.data_size || 0) || 0),
+      width: res.width,
+      height: res.height,
+      shortEdge: res.shortEdge,
+      pixels: res.pixels,
     });
+  };
 
-    let chosen: RawBitRate = sorted[0];
-    if (quality === 'lowest') {
-      chosen = sorted[sorted.length - 1];
-    } else if (quality in TARGET_HEIGHT_BY_QUALITY) {
-      const target = TARGET_HEIGHT_BY_QUALITY[quality]!;
-      chosen = sorted.reduce((best, curr) => {
-        const bestDim = Math.min(best.play_addr?.width || 1080, best.play_addr?.height || 1080);
-        const currDim = Math.min(curr.play_addr?.width || 1080, curr.play_addr?.height || 1080);
-        return Math.abs(currDim - target) < Math.abs(bestDim - target) ? curr : best;
-      }, sorted[0]);
+  if (Array.isArray(video?.bit_rate)) {
+    for (const entry of video.bit_rate) {
+      if (!entry || typeof entry !== 'object') continue;
+      const addrs = [
+        entry.play_addr,
+        entry.play_addr_h264,
+        entry.play_addr_265,
+        entry.play_addr_bytevc1,
+      ];
+      for (const addr of addrs) {
+        pushCandidate(addr, {
+          bitRate: entry.bit_rate,
+          width: entry.width,
+          height: entry.height,
+          gear_name: entry.gear_name,
+        });
+      }
     }
+  }
 
+  // Also inspect top-level play_addr variants when bit_rate is absent or lacks a higher-res track
+  const topLevelAddrs = [
+    video?.play_addr,
+    video?.play_addr_h264,
+    video?.play_addr_265,
+    video?.play_addr_256,
+    video?.play_addr_bytevc1,
+  ];
+  for (const addr of topLevelAddrs) {
+    if (!addr) continue;
+    // Only include top-level addrs when bit_rate is empty OR top-level provides explicit dimensions
+    if (candidates.length === 0 || (addr.width && addr.height)) {
+      pushCandidate(addr, {
+        width: addr.width || video?.width,
+        height: addr.height || video?.height,
+      });
+    }
+  }
+
+  if (candidates.length === 0 && video?.download_addr) {
+    pushCandidate(video.download_addr, {
+      width: video.download_addr.width || video.width,
+      height: video.download_addr.height || video.height,
+    });
+  }
+
+  if (candidates.length === 0) {
     return {
-      url: firstValidUrl(chosen.play_addr?.url_list),
-      sizeBytes: Number(chosen.play_addr?.data_size || 0),
-      width: chosen.play_addr?.width,
-      height: chosen.play_addr?.height,
+      url: undefined,
+      uri: video?.vid,
+      sizeBytes: 0,
+      width: video?.width,
+      height: video?.height,
     };
   }
 
-  const fallbackAddr = aweme.video?.play_addr || aweme.video?.download_addr;
+  const sorted = [...candidates];
+  if (quality === 'lowest') {
+    sorted.sort((a, b) => {
+      const brA = a.bitRate || Number.MAX_SAFE_INTEGER;
+      const brB = b.bitRate || Number.MAX_SAFE_INTEGER;
+      if (a.pixels !== b.pixels && a.pixels > 0 && b.pixels > 0) {
+        // Prefer lowest bitrate; if bitrates are missing, fall back to lowest resolution
+        if (brA !== brB) return brA - brB;
+        return a.pixels - b.pixels;
+      }
+      if (brA !== brB) return brA - brB;
+      if (a.pixels !== b.pixels) return a.pixels - b.pixels;
+      return a.dataSize - b.dataSize;
+    });
+  } else if (quality in TARGET_HEIGHT_BY_QUALITY) {
+    const target = TARGET_HEIGHT_BY_QUALITY[quality]!;
+    sorted.sort((a, b) => {
+      const diffA = a.shortEdge > 0 ? Math.abs(a.shortEdge - target) : Number.MAX_SAFE_INTEGER;
+      const diffB = b.shortEdge > 0 ? Math.abs(b.shortEdge - target) : Number.MAX_SAFE_INTEGER;
+      if (diffA !== diffB) return diffA - diffB;
+      if (b.bitRate !== a.bitRate) return b.bitRate - a.bitRate;
+      if (b.pixels !== a.pixels) return b.pixels - a.pixels;
+      return b.dataSize - a.dataSize;
+    });
+  } else {
+    // 'highest' and 'original' (base tier before optional original probe):
+    // Always prioritize highest pixel resolution first (so 1080p/2K/4K H.265 beats 720p H.264),
+    // then highest bit_rate within the same resolution, then data_size as tie-breaker.
+    sorted.sort((a, b) => {
+      if (b.pixels !== a.pixels) return b.pixels - a.pixels;
+      if (b.shortEdge !== a.shortEdge) return b.shortEdge - a.shortEdge;
+      if (b.bitRate !== a.bitRate) return b.bitRate - a.bitRate;
+      return b.dataSize - a.dataSize;
+    });
+  }
+
+  const chosen = sorted[0];
   return {
-    url: firstValidUrl(fallbackAddr?.url_list),
-    sizeBytes: Number(fallbackAddr?.data_size || 0),
-    width: fallbackAddr?.width || aweme.video?.width,
-    height: fallbackAddr?.height || aweme.video?.height,
+    url: chosen.url,
+    uri: chosen.uri || video?.play_addr?.uri || video?.vid,
+    sizeBytes: chosen.dataSize,
+    width: chosen.width || video?.width,
+    height: chosen.height || video?.height,
   };
 }
 
-export function extractGalleryImages(aweme: RawAweme): string[] {
-  const rawList = Array.isArray(aweme.images) && aweme.images.length > 0
-    ? aweme.images
-    : Array.isArray(aweme.image_infos)
-      ? aweme.image_infos
-      : [];
+function getImageResolutionScore(meta?: { width?: number; height?: number; w?: number; h?: number }): number {
+  if (!meta) return 0;
+  const w = Math.max(0, Math.round(Number(meta.width || meta.w || 0) || 0));
+  const h = Math.max(0, Math.round(Number(meta.height || meta.h || 0) || 0));
+  if (w > 0 && h > 0) return w * h;
+  return w || h || 0;
+}
 
+function getImageFormatRank(url: string): number {
+  let pathname = url.toLowerCase();
+  try {
+    pathname = new URL(url).pathname.toLowerCase();
+  } catch {
+    // use raw lowercased string
+  }
+  if (/\.(jpe?g|png)(?:[^a-z0-9]|$)/i.test(pathname)) return 0;
+  if (/\.(webp|heic|heif)(?:[^a-z0-9]|$)/i.test(pathname)) return 2;
+  return 1;
+}
+
+function iterGalleryItems(aweme: RawAweme): RawImageItem[] {
+  const fromImagePost = aweme.image_post_info?.images || aweme.image_post_info?.image_list;
+  if (Array.isArray(fromImagePost) && fromImagePost.length > 0) {
+    return fromImagePost;
+  }
+  if (Array.isArray(aweme.images) && aweme.images.length > 0) {
+    return aweme.images;
+  }
+  if (Array.isArray(aweme.image_list) && aweme.image_list.length > 0) {
+    return aweme.image_list;
+  }
+  if (Array.isArray(aweme.image_infos) && aweme.image_infos.length > 0) {
+    return aweme.image_infos;
+  }
+  return [];
+}
+
+function pickBestImageUrlFromItem(img: RawImageItem): string | undefined {
+  // Source priority matches Douyin's real asset semantics:
+  // rank 0..3 = watermark-free display/origin assets;
+  // rank 4..7 = download/owner_watermark assets (often carry ~tplv-dy-water watermarks).
+  const sources: Array<{
+    urls: string[];
+    meta?: { width?: number; height?: number; w?: number; h?: number };
+    sourceRank: number;
+  }> = [
+    { urls: extractUrlStrings(img.watermark_free_download_url_list), meta: img, sourceRank: 0 },
+    { urls: extractUrlStrings(img.origin_image), meta: img.origin_image || img, sourceRank: 1 },
+    { urls: extractUrlStrings(img.display_image), meta: img.display_image || img, sourceRank: 2 },
+    { urls: extractUrlStrings(img), meta: img, sourceRank: 3 },
+    {
+      urls: extractUrlStrings(img.download_url),
+      meta: typeof img.download_url === 'object' ? img.download_url : img,
+      sourceRank: 4,
+    },
+    { urls: extractUrlStrings(img.download_addr), meta: img.download_addr || img, sourceRank: 5 },
+    { urls: extractUrlStrings(img.download_url_list), meta: img, sourceRank: 6 },
+    {
+      urls: extractUrlStrings(img.owner_watermark_image),
+      meta: img.owner_watermark_image || img,
+      sourceRank: 7,
+    },
+  ];
+
+  const ranked: Array<{
+    url: string;
+    watermarkRank: number;
+    pixels: number;
+    sourceRank: number;
+    formatRank: number;
+    order: number;
+  }> = [];
+
+  let order = 0;
+  for (const src of sources) {
+    const pixels = getImageResolutionScore(src.meta);
+    for (const rawUrl of src.urls) {
+      const normalizedUrl = rawUrl.replace(/^http:\/\//i, 'https://');
+      const watermarkRank =
+        src.sourceRank >= 4 || isWatermarkedMediaUrl(normalizedUrl) ? 1 : 0;
+      ranked.push({
+        url: normalizedUrl,
+        watermarkRank,
+        pixels,
+        sourceRank: src.sourceRank,
+        formatRank: getImageFormatRank(normalizedUrl),
+        order: order++,
+      });
+    }
+  }
+
+  if (ranked.length === 0) return undefined;
+
+  ranked.sort(
+    (a, b) =>
+      a.watermarkRank - b.watermarkRank ||
+      b.pixels - a.pixels ||
+      a.sourceRank - b.sourceRank ||
+      a.formatRank - b.formatRank ||
+      a.order - b.order,
+  );
+
+  return ranked[0].url;
+}
+
+export function extractGalleryImages(aweme: RawAweme): string[] {
+  const rawList = iterGalleryItems(aweme);
   const urls: string[] = [];
   for (const img of rawList) {
-    const candidates = [
-      ...(Array.isArray(img.download_url_list) ? img.download_url_list : []),
-      ...(Array.isArray(img.url_list) ? img.url_list : []),
-    ].filter((u) => typeof u === 'string' && u.startsWith('http'));
-
-    if (candidates.length === 0) continue;
-    const preferred =
-      candidates.find((u) => /\.(jpe?g|png)(\?|$)/i.test(u)) || candidates[0];
-    urls.push(preferred.replace(/^http:\/\//i, 'https://'));
+    if (!img || typeof img !== 'object') continue;
+    const best = pickBestImageUrlFromItem(img);
+    if (best) {
+      urls.push(best);
+    }
   }
   return urls;
+}
+
+function pickBestCoverUrl(aweme: RawAweme, galleryImages: string[]): string | undefined {
+  const sources = [
+    ...extractUrlStrings(aweme.video?.origin_cover),
+    ...extractUrlStrings(aweme.video?.cover_original_scale),
+    ...extractUrlStrings(aweme.video?.cover),
+  ].map((u) => u.replace(/^http:\/\//i, 'https://'));
+
+  if (sources.length > 0) {
+    const ranked = sources.map((url, idx) => ({
+      url,
+      watermarkRank: isWatermarkedMediaUrl(url) ? 1 : 0,
+      formatRank: getImageFormatRank(url),
+      idx,
+    }));
+    ranked.sort(
+      (a, b) =>
+        a.watermarkRank - b.watermarkRank ||
+        a.formatRank - b.formatRank ||
+        a.idx - b.idx,
+    );
+    return ranked[0].url;
+  }
+
+  return galleryImages[0];
 }
 
 export function formatUnixDate(ts?: number): string {
@@ -191,17 +593,14 @@ export function parseAwemeToMedia(
   if (!awemeId) return null;
 
   const imageUrls = extractGalleryImages(aweme);
+  const videoPicked = pickBestVideoMedia(aweme, quality);
+  // Some /note/ awemes with aweme_type=68 carry video-only assets with no gallery images;
+  // only treat as gallery when gallery images exist (or no video asset is available).
   const isGallery =
-    imageUrls.length > 0 || aweme.aweme_type === 68 || aweme.aweme_type === 2;
-  const videoPicked = isGallery
-    ? { url: undefined, sizeBytes: 0, width: undefined, height: undefined }
-    : pickBestVideoMedia(aweme, quality);
+    imageUrls.length > 0 ||
+    ((aweme.aweme_type === 68 || aweme.aweme_type === 2) && !videoPicked.url);
 
-  const coverUrl =
-    firstValidUrl(aweme.video?.origin_cover?.url_list) ||
-    firstValidUrl(aweme.video?.cover?.url_list) ||
-    imageUrls[0];
-
+  const coverUrl = pickBestCoverUrl(aweme, imageUrls);
   const musicUrl = firstValidUrl(aweme.music?.play_url?.url_list);
   const avatarUrl =
     firstValidUrl(aweme.author?.avatar_larger?.url_list) ||
@@ -221,14 +620,15 @@ export function parseAwemeToMedia(
     publishDate,
     publishTs,
     mediaType: isGallery ? 'gallery' : 'video',
-    videoUrl: videoPicked.url,
+    videoUrl: isGallery ? undefined : videoPicked.url,
+    videoUri: isGallery ? undefined : videoPicked.uri,
     imageUrls,
     coverUrl,
     musicUrl,
     avatarUrl,
-    sizeBytes: videoPicked.sizeBytes,
-    width: videoPicked.width,
-    height: videoPicked.height,
+    sizeBytes: isGallery ? 0 : videoPicked.sizeBytes,
+    width: isGallery ? undefined : videoPicked.width,
+    height: isGallery ? undefined : videoPicked.height,
     diggCount: aweme.statistics?.digg_count,
     commentCount: aweme.statistics?.comment_count,
     raw: aweme as unknown as Record<string, unknown>,

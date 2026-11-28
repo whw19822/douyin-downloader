@@ -143,6 +143,9 @@ function mediaToDiscoveredWork(
     publishDate: media.publishDate,
     publishTs: media.publishTs,
     videoUrl: media.videoUrl,
+    videoUri: media.videoUri,
+    width: media.width,
+    height: media.height,
     imageUrls: media.imageUrls,
     coverUrl: media.coverUrl,
     musicUrl: media.musicUrl,
@@ -2038,6 +2041,68 @@ export async function discoverWorksForLink(
       settings.cookieString,
       link.type === 'gallery',
     );
+
+    const shareRawVideo = shareMedia?.raw?.video as { bit_rate?: unknown[] } | undefined;
+    const shareHasBitRates =
+      Array.isArray(shareRawVideo?.bit_rate) && shareRawVideo!.bit_rate!.length > 0;
+    const shareShortEdge =
+      shareMedia?.width && shareMedia?.height
+        ? Math.min(shareMedia.width, shareMedia.height)
+        : 0;
+    const wantsHighResVideo =
+      settings.videoQuality === 'highest' ||
+      settings.videoQuality === 'original' ||
+      settings.videoQuality === '1440p' ||
+      settings.videoQuality === '1080p';
+
+    // Mobile share pages often omit video.bit_rate and only expose a 540p/720p stream.
+    // When a cookie is available and user requested high quality, try desktop aweme/detail
+    // via Chromium to fetch the full bit_rate ladder, falling back to shareMedia if needed.
+    if (
+      shareMedia &&
+      shareMedia.awemeId === awemeId &&
+      (shareMedia.mediaType !== 'video' ||
+        shareHasBitRates ||
+        shareShortEdge >= 1080 ||
+        !wantsHighResVideo ||
+        !settings.cookieString.trim())
+    ) {
+      return {
+        works: [mediaToDiscoveredWork(shareMedia, targetDesktopUrl, 'post')],
+        warnings: [],
+      };
+    }
+
+    let cdpWorks: DiscoveredWork[] = [];
+    let cdpRequiresCookie = false;
+    try {
+      const cdpRes = await scrapePageViaChromium(targetDesktopUrl, {
+        quality: settings.videoQuality,
+        cookieString: settings.cookieString,
+        mode: 'post',
+        maxItems: 1,
+        sourceUrl: targetDesktopUrl,
+        paginate: false,
+        target: {
+          kind: 'single',
+          expectedAwemeId: awemeId,
+          strictAuthorFilter: false,
+        },
+      });
+      cdpWorks = cdpRes.works;
+      cdpRequiresCookie = cdpRes.loginRequired || cdpRes.emptyBlockedResponses > 0;
+    } catch {
+      // Fall back to shareMedia if desktop Chromium is unavailable
+    }
+
+    if (cdpWorks.length > 0) {
+      return {
+        works: cdpWorks,
+        warnings: [],
+        requiresCookie: false,
+      };
+    }
+
     if (shareMedia && shareMedia.awemeId === awemeId) {
       return {
         works: [mediaToDiscoveredWork(shareMedia, targetDesktopUrl, 'post')],
@@ -2045,28 +2110,13 @@ export async function discoverWorksForLink(
       };
     }
 
-    const cdpRes = await scrapePageViaChromium(targetDesktopUrl, {
-      quality: settings.videoQuality,
-      cookieString: settings.cookieString,
-      mode: 'post',
-      maxItems: 1,
-      sourceUrl: targetDesktopUrl,
-      paginate: false,
-      target: {
-        kind: 'single',
-        expectedAwemeId: awemeId,
-        strictAuthorFilter: false,
-      },
-    });
-    if (cdpRes.works.length === 0) {
-      warnings.push(
-        `作品 ${awemeId} 未能解析到直链（可能已删除、设为私密或需要填入有效抖音 Cookie）。`,
-      );
-    }
+    warnings.push(
+      `作品 ${awemeId} 未能解析到直链（可能已删除、设为私密或需要填入有效抖音 Cookie）。`,
+    );
     return {
-      works: cdpRes.works,
+      works: [],
       warnings,
-      requiresCookie: cdpRes.loginRequired || cdpRes.emptyBlockedResponses > 0,
+      requiresCookie: cdpRequiresCookie,
     };
   }
 

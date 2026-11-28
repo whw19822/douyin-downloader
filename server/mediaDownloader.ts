@@ -58,17 +58,90 @@ export interface MediaDownloadResult {
   outputDir: string;
 }
 
-function guessImageExt(url: string, contentType?: string | null): string {
+export function guessImageExt(url: string, contentType?: string | null): string {
   const ct = (contentType || '').toLowerCase();
   if (ct.includes('png')) return '.png';
   if (ct.includes('webp')) return '.webp';
   if (ct.includes('gif')) return '.gif';
   if (ct.includes('jpeg') || ct.includes('jpg')) return '.jpg';
-  const match = url.match(/\.(jpe?g|png|webp|gif)(?:[?#]|$)/i);
-  if (match) {
-    return match[1].toLowerCase() === 'jpeg' ? '.jpg' : `.${match[1].toLowerCase()}`;
+
+  let pathname = url;
+  try {
+    pathname = new URL(url).pathname;
+  } catch {
+    // use raw url
+  }
+  const matches = pathname.match(/\.(jpe?g|png|webp|gif)(?=[^a-z0-9]|$)/gi);
+  if (matches && matches.length > 0) {
+    const ext = matches[matches.length - 1].toLowerCase();
+    return ext === '.jpeg' ? '.jpg' : ext;
   }
   return '.jpg';
+}
+
+export async function probeOriginalVideoUrl(
+  videoUri: string,
+  selectedSizeBytes: number,
+  options: {
+    cookieString?: string;
+    signal?: AbortSignal;
+    fetchImpl?: typeof fetch;
+  } = {},
+): Promise<{ url: string; sizeBytes: number } | null> {
+  if (!videoUri || !videoUri.trim()) return null;
+  const fetchFn = options.fetchImpl ?? globalThis.fetch;
+  if (typeof fetchFn !== 'function') return null;
+
+  const probeUrl =
+    `https://www.douyin.com/aweme/v1/play/?video_id=${encodeURIComponent(videoUri.trim())}` +
+    '&ratio=default&line=0&is_play_url=1&watermark=0&source=PackSourceEnum_PUBLISH';
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 8_000);
+  const onParentAbort = () => controller.abort();
+  options.signal?.addEventListener('abort', onParentAbort, { once: true });
+
+  try {
+    const headers: Record<string, string> = {
+      'User-Agent': DOWNLOAD_USER_AGENT,
+      Referer: 'https://www.douyin.com/',
+      Accept: '*/*',
+      Range: 'bytes=0-0',
+    };
+    if (options.cookieString?.trim()) {
+      headers.Cookie = options.cookieString.trim();
+    }
+    const res = await fetchFn(probeUrl, {
+      method: 'GET',
+      headers,
+      redirect: 'follow',
+      signal: controller.signal,
+    });
+    if (res.status !== 200 && res.status !== 206) return null;
+    const ct = (res.headers.get('content-type') || '').toLowerCase();
+    if (!ct.startsWith('video/')) return null;
+
+    const finalUrl = res.url || probeUrl;
+    if (!isAllowedMediaHost(finalUrl)) return null;
+
+    const contentRange = res.headers.get('content-range') || '';
+    const rawTotal = contentRange.includes('/')
+      ? contentRange.split('/').pop()
+      : res.headers.get('content-length');
+    const totalSize = Number(rawTotal || 0);
+    if (!Number.isFinite(totalSize) || totalSize <= 0) return null;
+
+    // Only promote original stream when it is genuinely larger than the selected transcoded tier
+    if (selectedSizeBytes > 0 && totalSize <= selectedSizeBytes) {
+      return null;
+    }
+    return { url: finalUrl, sizeBytes: totalSize };
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+    options.signal?.removeEventListener('abort', onParentAbort);
+  }
 }
 
 async function downloadBinaryFile(
@@ -76,10 +149,12 @@ async function downloadBinaryFile(
   destPath: string,
   options: {
     cookieString?: string;
+    accept?: string;
+    adjustExtByContentType?: boolean;
     onProgress?: (received: number, total: number) => void;
     signal?: AbortSignal;
   } = {},
-): Promise<{ sizeBytes: number; contentType: string | null }> {
+): Promise<{ sizeBytes: number; contentType: string | null; finalPath: string }> {
   if (!isAllowedMediaHost(url)) {
     throw new Error(`媒体链接域名不在白名单内: ${url.slice(0, 80)}`);
   }
@@ -87,7 +162,7 @@ async function downloadBinaryFile(
   const headers: Record<string, string> = {
     'User-Agent': DOWNLOAD_USER_AGENT,
     Referer: 'https://www.douyin.com/',
-    Accept: '*/*',
+    Accept: options.accept || '*/*',
   };
   if (options.cookieString?.trim()) {
     headers.Cookie = options.cookieString.trim();
@@ -110,9 +185,17 @@ async function downloadBinaryFile(
 
   const contentLength = Number(response.headers.get('content-length') || 0);
   const contentType = response.headers.get('content-type');
-  await fsp.mkdir(path.dirname(destPath), { recursive: true });
+  let finalPath = destPath;
+  if (options.adjustExtByContentType && contentType) {
+    const detectedExt = guessImageExt(url, contentType);
+    const currentExt = path.extname(destPath).toLowerCase();
+    if (detectedExt && detectedExt !== currentExt) {
+      finalPath = `${destPath.slice(0, destPath.length - currentExt.length)}${detectedExt}`;
+    }
+  }
+  await fsp.mkdir(path.dirname(finalPath), { recursive: true });
 
-  const tmpPath = `${destPath}.part`;
+  const tmpPath = `${finalPath}.part`;
   let received = 0;
 
   try {
@@ -130,8 +213,8 @@ async function downloadBinaryFile(
     if (stat.size === 0) {
       throw new Error('下载文件为空 (0 字节)');
     }
-    await fsp.rename(tmpPath, destPath);
-    return { sizeBytes: stat.size, contentType };
+    await fsp.rename(tmpPath, finalPath);
+    return { sizeBytes: stat.size, contentType, finalPath };
   } catch (err) {
     await fsp.rm(tmpPath, { force: true }).catch(() => undefined);
     throw err;
@@ -256,34 +339,61 @@ export async function downloadAwemeMediaToDisk(
         Math.round((i / count) * 80),
         `正在下载图集第 ${i + 1}/${count} 张无水印原图...`,
       );
-      const { sizeBytes } = await downloadBinaryFile(imgUrl, dest, {
+      const { sizeBytes, finalPath } = await downloadBinaryFile(imgUrl, dest, {
         cookieString: settings.cookieString,
+        accept: 'image/jpeg,image/png,*/*;q=0.8',
+        adjustExtByContentType: true,
         signal: options.signal,
       });
-      pushFile('image', dest, sizeBytes);
+      pushFile('image', finalPath, sizeBytes);
     }
   } else if (settings.includeVideo && media.videoUrl) {
     const dest = path.join(itemDir, `${safeStem}.mp4`);
+    let targetVideoUrl = media.videoUrl;
+    if (settings.videoQuality === 'original' && media.videoUri) {
+      options.onProgress?.(6, '正在探测上传原始画质流...');
+      const probed = await probeOriginalVideoUrl(media.videoUri, media.sizeBytes, {
+        cookieString: settings.cookieString,
+        signal: options.signal,
+      });
+      if (probed?.url) {
+        targetVideoUrl = probed.url;
+      }
+    }
+
     options.onProgress?.(10, '正在连接抖音 CDN 流式下载无水印视频...');
-    const { sizeBytes } = await downloadBinaryFile(media.videoUrl, dest, {
-      cookieString: settings.cookieString,
-      signal: options.signal,
-      onProgress: (received, total) => {
-        if (total > 0) {
-          const pct = Math.min(88, Math.max(12, Math.round((received / total) * 85)));
-          options.onProgress?.(
-            pct,
-            `正在下载视频 ${(received / 1048576).toFixed(1)} / ${(total / 1048576).toFixed(1)} MB`,
-          );
-        } else {
-          options.onProgress?.(
-            50,
-            `正在下载视频 ${(received / 1048576).toFixed(1)} MB...`,
-          );
-        }
-      },
-    });
-    pushFile('video', dest, sizeBytes);
+    let downloaded: { sizeBytes: number; finalPath: string };
+    try {
+      downloaded = await downloadBinaryFile(targetVideoUrl, dest, {
+        cookieString: settings.cookieString,
+        signal: options.signal,
+        onProgress: (received, total) => {
+          if (total > 0) {
+            const pct = Math.min(88, Math.max(12, Math.round((received / total) * 85)));
+            options.onProgress?.(
+              pct,
+              `正在下载视频 ${(received / 1048576).toFixed(1)} / ${(total / 1048576).toFixed(1)} MB`,
+            );
+          } else {
+            options.onProgress?.(
+              50,
+              `正在下载视频 ${(received / 1048576).toFixed(1)} MB...`,
+            );
+          }
+        },
+      });
+    } catch (err) {
+      if (targetVideoUrl !== media.videoUrl && !options.signal?.aborted) {
+        // Fallback to selected highest transcoded track if probed original stream fails
+        downloaded = await downloadBinaryFile(media.videoUrl, dest, {
+          cookieString: settings.cookieString,
+          signal: options.signal,
+        });
+      } else {
+        throw err;
+      }
+    }
+    pushFile('video', downloaded.finalPath, downloaded.sizeBytes);
   } else if (media.mediaType === 'video' && !media.videoUrl) {
     throw new Error('未获取到该视频的直链地址（可能触发风控或作品不可见）');
   }
@@ -292,11 +402,13 @@ export async function downloadAwemeMediaToDisk(
     try {
       const ext = guessImageExt(media.coverUrl);
       const dest = path.join(itemDir, `${safeStem}_cover${ext}`);
-      const { sizeBytes } = await downloadBinaryFile(media.coverUrl, dest, {
+      const { sizeBytes, finalPath } = await downloadBinaryFile(media.coverUrl, dest, {
         cookieString: settings.cookieString,
+        accept: 'image/jpeg,image/png,*/*;q=0.8',
+        adjustExtByContentType: true,
         signal: options.signal,
       });
-      pushFile('cover', dest, sizeBytes);
+      pushFile('cover', finalPath, sizeBytes);
     } catch {
       // non-fatal accessory artifact
     }
@@ -305,11 +417,11 @@ export async function downloadAwemeMediaToDisk(
   if (settings.includeMusic && media.musicUrl) {
     try {
       const dest = path.join(itemDir, `${safeStem}_music.mp3`);
-      const { sizeBytes } = await downloadBinaryFile(media.musicUrl, dest, {
+      const { sizeBytes, finalPath } = await downloadBinaryFile(media.musicUrl, dest, {
         cookieString: settings.cookieString,
         signal: options.signal,
       });
-      pushFile('music', dest, sizeBytes);
+      pushFile('music', finalPath, sizeBytes);
     } catch {
       // non-fatal accessory artifact
     }
@@ -319,11 +431,13 @@ export async function downloadAwemeMediaToDisk(
     try {
       const ext = guessImageExt(media.avatarUrl);
       const dest = path.join(itemDir, `${safeStem}_avatar${ext}`);
-      const { sizeBytes } = await downloadBinaryFile(media.avatarUrl, dest, {
+      const { sizeBytes, finalPath } = await downloadBinaryFile(media.avatarUrl, dest, {
         cookieString: settings.cookieString,
+        accept: 'image/jpeg,image/png,*/*;q=0.8',
+        adjustExtByContentType: true,
         signal: options.signal,
       });
-      pushFile('avatar', dest, sizeBytes);
+      pushFile('avatar', finalPath, sizeBytes);
     } catch {
       // non-fatal accessory artifact
     }

@@ -45,6 +45,9 @@ export interface DiscoveredWork {
   publishDate: string;
   publishTs: number;
   videoUrl?: string;
+  videoUri?: string;
+  width?: number;
+  height?: number;
   imageUrls: string[];
   coverUrl?: string;
   musicUrl?: string;
@@ -125,6 +128,7 @@ export interface JobItem {
   message: string;
   upstreamStatus: 'live' | 'resolved' | 'offline-manifest';
   mediaUrl?: string;
+  videoUri?: string;
   imageUrls?: string[];
   coverUrl?: string;
   musicUrl?: string;

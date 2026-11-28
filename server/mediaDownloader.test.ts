@@ -3,7 +3,11 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { resolveMediaOutputLocation } from './mediaDownloader';
+import {
+  guessImageExt,
+  probeOriginalVideoUrl,
+  resolveMediaOutputLocation,
+} from './mediaDownloader';
 import { BatchJobStore } from './jobStore';
 import { PersistenceStore } from './persistence';
 import { DEFAULT_BATCH_SETTINGS } from '../src/lib/types';
@@ -157,4 +161,52 @@ test('BatchJobStore skips archived works even when local files are missing when 
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
+});
+
+test('guessImageExt handles Douyin CDN tilde paths and Content-Type accurately', () => {
+  assert.equal(
+    guessImageExt('https://p3-sign.douyinpic.com/tos-cn-i-1~tplv-dy-aweme-images:q75.webp?x=1'),
+    '.webp',
+  );
+  assert.equal(
+    guessImageExt('https://p3-sign.douyinpic.com/tos-cn-i-1~noop.jpeg?x=1'),
+    '.jpg',
+  );
+  assert.equal(
+    guessImageExt('https://p3-sign.douyinpic.com/tos-cn-i-1~noop.image?x=1', 'image/webp'),
+    '.webp',
+  );
+});
+
+test('probeOriginalVideoUrl promotes original stream only when larger than selected transcoded tier', async () => {
+  const largerMockFetch = (async () => ({
+    status: 206,
+    url: 'https://v26-web.douyinvod.com/original-master.mp4',
+    headers: new Headers({
+      'content-type': 'video/mp4',
+      'content-range': 'bytes 0-0/45000000',
+    }),
+  })) as unknown as typeof fetch;
+
+  const promoted = await probeOriginalVideoUrl('v0200_uri', 12_000_000, {
+    fetchImpl: largerMockFetch,
+  });
+  assert.deepEqual(promoted, {
+    url: 'https://v26-web.douyinvod.com/original-master.mp4',
+    sizeBytes: 45_000_000,
+  });
+
+  const smallerMockFetch = (async () => ({
+    status: 206,
+    url: 'https://v26-web.douyinvod.com/smaller-orig.mp4',
+    headers: new Headers({
+      'content-type': 'video/mp4',
+      'content-range': 'bytes 0-0/8000000',
+    }),
+  })) as unknown as typeof fetch;
+
+  const rejected = await probeOriginalVideoUrl('v0200_uri', 12_000_000, {
+    fetchImpl: smallerMockFetch,
+  });
+  assert.equal(rejected, null);
 });

@@ -532,6 +532,7 @@ export function BatchDownloaderView({
                                   </div>
                                   <div className="text-[11px] text-slate-500 dark:text-slate-400 truncate mt-0.5 tabular-nums">
                                     {work.author} · ID {work.awemeId}
+                                    {work.width && work.height ? ` · ${work.width}×${work.height}` : ''}
                                     {work.sizeBytes > 0 && ` · ${formatBytes(work.sizeBytes)}`}
                                   </div>
                                 </div>
