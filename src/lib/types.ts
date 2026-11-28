@@ -46,8 +46,11 @@ export interface DiscoveredWork {
   publishTs: number;
   videoUrl?: string;
   videoUri?: string;
+  isNeedSetCookie?: boolean;
   width?: number;
   height?: number;
+  sourceWidth?: number;
+  sourceHeight?: number;
   imageUrls: string[];
   coverUrl?: string;
   musicUrl?: string;
@@ -129,6 +132,11 @@ export interface JobItem {
   upstreamStatus: 'live' | 'resolved' | 'offline-manifest';
   mediaUrl?: string;
   videoUri?: string;
+  isNeedSetCookie?: boolean;
+  width?: number;
+  height?: number;
+  sourceWidth?: number;
+  sourceHeight?: number;
   imageUrls?: string[];
   coverUrl?: string;
   musicUrl?: string;

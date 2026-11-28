@@ -5,9 +5,11 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   guessImageExt,
+  isAllowedMediaHost,
   probeOriginalVideoUrl,
   resolveMediaOutputLocation,
 } from './mediaDownloader';
+import { generateXBogus } from './xbogus';
 import { BatchJobStore } from './jobStore';
 import { PersistenceStore } from './persistence';
 import { DEFAULT_BATCH_SETTINGS } from '../src/lib/types';
@@ -178,24 +180,45 @@ test('guessImageExt handles Douyin CDN tilde paths and Content-Type accurately',
   );
 });
 
-test('probeOriginalVideoUrl promotes original stream only when larger than selected transcoded tier', async () => {
-  const largerMockFetch = (async () => ({
-    status: 206,
-    url: 'https://v26-web.douyinvod.com/original-master.mp4',
-    headers: new Headers({
-      'content-type': 'video/mp4',
-      'content-range': 'bytes 0-0/45000000',
-    }),
-  })) as unknown as typeof fetch;
+test('probeOriginalVideoUrl signs desktop play URL with X-Bogus, falls back to snssdk mobile play, and enforces size/4K rules', async () => {
+  const signed = generateXBogus(
+    'https://www.douyin.com/aweme/v1/play/?video_id=v0200_uri&ratio=default',
+    undefined,
+    1700000000,
+  );
+  assert.ok(signed.signedUrl.includes('&X-Bogus='));
+  assert.ok(signed.token.length >= 20);
+  assert.equal(isAllowedMediaHost('https://v99-coldx.bytevcloud.com/original.mp4'), true);
+
+  // Desktop 403 -> automatically falls back to aweme.snssdk.com mobile play endpoint
+  const calledUrls: string[] = [];
+  const fallbackMockFetch = (async (url: string) => {
+    calledUrls.push(String(url));
+    if (String(url).includes('www.douyin.com')) {
+      return { status: 403, url: String(url), headers: new Headers() };
+    }
+    return {
+      status: 206,
+      url: 'https://v99-coldx.douyinvod.com/original-4k.mp4',
+      headers: new Headers({
+        'content-type': 'video/mp4',
+        'content-range': 'bytes 0-0/45000000',
+      }),
+    };
+  }) as unknown as typeof fetch;
 
   const promoted = await probeOriginalVideoUrl('v0200_uri', 12_000_000, {
-    fetchImpl: largerMockFetch,
+    isNeedSetCookie: true,
+    fetchImpl: fallbackMockFetch,
   });
-  assert.deepEqual(promoted, {
-    url: 'https://v26-web.douyinvod.com/original-master.mp4',
-    sizeBytes: 45_000_000,
-  });
+  assert.equal(calledUrls.length, 2);
+  assert.ok(calledUrls[0].includes('X-Bogus='));
+  assert.ok(calledUrls[0].includes('ss_is_p_v_ss=1'));
+  assert.ok(calledUrls[1].startsWith('https://aweme.snssdk.com/aweme/v1/play/'));
+  assert.equal(promoted?.url, 'https://v99-coldx.douyinvod.com/original-4k.mp4');
+  assert.equal(promoted?.sizeBytes, 45_000_000);
 
+  // Smaller same-resolution probe is rejected
   const smallerMockFetch = (async () => ({
     status: 206,
     url: 'https://v26-web.douyinvod.com/smaller-orig.mp4',
@@ -209,4 +232,18 @@ test('probeOriginalVideoUrl promotes original stream only when larger than selec
     fetchImpl: smallerMockFetch,
   });
   assert.equal(rejected, null);
+
+  // Higher-res source (e.g. 2160x3840 H.265 master vs 1080p H.264 track) promotes when >= 65% size
+  const promoted4k = await probeOriginalVideoUrl('v0200_uri', 12_000_000, {
+    preferHigherResSource: true,
+    fetchImpl: (async () => ({
+      status: 206,
+      url: 'https://v26-web.douyinvod.com/4k-hevc.mp4',
+      headers: new Headers({
+        'content-type': 'video/mp4',
+        'content-range': 'bytes 0-0/10000000',
+      }),
+    })) as unknown as typeof fetch,
+  });
+  assert.equal(promoted4k?.url, 'https://v26-web.douyinvod.com/4k-hevc.mp4');
 });

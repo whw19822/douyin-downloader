@@ -161,7 +161,7 @@ test('pickBestVideoMedia highest prefers higher resolution (e.g. 1080p/4K H.265)
   assert.equal(p720.url, 'https://v26-web.douyinvod.com/720p-h264.mp4');
 });
 
-test('pickBestVideoMedia upgrades ratio=720p on mobile share play_addr URLs when highest quality requested', () => {
+test('pickBestVideoMedia upgrades ratio=720p on mobile share play_addr URLs to ratio=default for highest/original', () => {
   const raw = {
     aweme_id: '7500000000000000002',
     video: {
@@ -175,9 +175,68 @@ test('pickBestVideoMedia upgrades ratio=720p on mobile share play_addr URLs when
   const highest = pickBestVideoMedia(raw, 'highest');
   assert.equal(
     highest.url,
-    'https://aweme.snssdk.com/aweme/v1/play/?video_id=v0300fg1_share&ratio=1080p&line=0',
+    'https://aweme.snssdk.com/aweme/v1/play/?video_id=v0300fg1_share&ratio=default&line=0',
   );
   assert.equal(highest.uri, 'v0300fg1_share');
+
+  const explicit1080 = pickBestVideoMedia(raw, '1080p');
+  assert.equal(
+    explicit1080.url,
+    'https://aweme.snssdk.com/aweme/v1/play/?video_id=v0300fg1_share&ratio=1080p&line=0',
+  );
+});
+
+test('pickBestVideoMedia ignores fake 4K dimensions on top-level video.play_addr when bit_rate tracks exist', () => {
+  const raw = {
+    aweme_id: '7500000000000000009',
+    video: {
+      width: 2160,
+      height: 3840,
+      vid: 'v0200_canonical_4k',
+      is_need_set_cookie: 1,
+      play_addr: {
+        uri: 'v0200_canonical_4k',
+        width: 2160,
+        height: 3840,
+        data_size: 10_000_000,
+        url_list: ['https://v26-web.douyinvod.com/fake-4k-actually-1080p.mp4'],
+      },
+      bit_rate: [
+        {
+          gear_name: 'normal_1080_0',
+          bit_rate: 4_200_000,
+          play_addr: {
+            uri: 'v0200_gear_1080',
+            width: 1080,
+            height: 1920,
+            data_size: 14_000_000,
+            url_list: ['https://v26-web.douyinvod.com/real-1080p-hq.mp4'],
+          },
+        },
+        {
+          gear_name: 'normal_1440_0',
+          bit_rate: 6_000_000,
+          play_addr: {
+            uri: 'v0200_gear_1440',
+            width: 1440,
+            height: 2560,
+            data_size: 20_000_000,
+            url_list: ['https://v26-web.douyinvod.com/real-1440p.mp4'],
+          },
+        },
+      ],
+    },
+  };
+
+  const highest = pickBestVideoMedia(raw, 'highest');
+  // Must pick real 1440p bit_rate track instead of top-level play_addr with fake 2160x3840 metadata!
+  assert.equal(highest.url, 'https://v26-web.douyinvod.com/real-1440p.mp4');
+  assert.equal(highest.width, 1440);
+  assert.equal(highest.height, 2560);
+  assert.equal(highest.sourceWidth, 2160);
+  assert.equal(highest.sourceHeight, 3840);
+  assert.equal(highest.uri, 'v0200_canonical_4k');
+  assert.equal(highest.isNeedSetCookie, true);
 });
 
 test('extractGalleryImages strictly prefers watermark-free url_list/origin_image over watermarked download_url_list', () => {

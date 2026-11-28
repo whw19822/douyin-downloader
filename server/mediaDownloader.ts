@@ -8,9 +8,13 @@ import type { Response } from 'express';
 import { sanitizeFilename } from '../src/lib/naming';
 import type { ParsedAwemeMedia } from '../src/lib/douyinParser';
 import type { BatchSettings } from '../src/lib/types';
+import { DEFAULT_XBOGUS_UA, generateXBogus } from './xbogus';
 
 const DOWNLOAD_USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+
+const MOBILE_PLAY_UA =
+  'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1';
 
 const ALLOWED_MEDIA_HOST_SUFFIXES = [
   'douyin.com',
@@ -22,6 +26,15 @@ const ALLOWED_MEDIA_HOST_SUFFIXES = [
   'byteimg.com',
   'bytedance.com',
   'bytetos.com',
+  'bytevcloud.com',
+  'bytecdn.cn',
+  'bytefcdnrd.com',
+  'bytednsdoc.com',
+  'bytegecko.com',
+  'bytegoofy.com',
+  'bdxiguavod.com',
+  'bdxiguaimg.com',
+  'vlabvod.com',
   'snssdk.com',
   'amemv.com',
   'zjcdn.com',
@@ -84,64 +97,113 @@ export async function probeOriginalVideoUrl(
   selectedSizeBytes: number,
   options: {
     cookieString?: string;
+    isNeedSetCookie?: boolean;
+    preferHigherResSource?: boolean;
     signal?: AbortSignal;
     fetchImpl?: typeof fetch;
   } = {},
-): Promise<{ url: string; sizeBytes: number } | null> {
+): Promise<{ url: string; sizeBytes: number; userAgent?: string } | null> {
   if (!videoUri || !videoUri.trim()) return null;
   const fetchFn = options.fetchImpl ?? globalThis.fetch;
   if (typeof fetchFn !== 'function') return null;
 
-  const probeUrl =
-    `https://www.douyin.com/aweme/v1/play/?video_id=${encodeURIComponent(videoUri.trim())}` +
-    '&ratio=default&line=0&is_play_url=1&watermark=0&source=PackSourceEnum_PUBLISH';
-
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 8_000);
-  const onParentAbort = () => controller.abort();
-  options.signal?.addEventListener('abort', onParentAbort, { once: true });
-
-  try {
-    const headers: Record<string, string> = {
-      'User-Agent': DOWNLOAD_USER_AGENT,
-      Referer: 'https://www.douyin.com/',
-      Accept: '*/*',
-      Range: 'bytes=0-0',
-    };
-    if (options.cookieString?.trim()) {
-      headers.Cookie = options.cookieString.trim();
-    }
-    const res = await fetchFn(probeUrl, {
-      method: 'GET',
-      headers,
-      redirect: 'follow',
-      signal: controller.signal,
-    });
-    if (res.status !== 200 && res.status !== 206) return null;
-    const ct = (res.headers.get('content-type') || '').toLowerCase();
-    if (!ct.startsWith('video/')) return null;
-
-    const finalUrl = res.url || probeUrl;
-    if (!isAllowedMediaHost(finalUrl)) return null;
-
-    const contentRange = res.headers.get('content-range') || '';
-    const rawTotal = contentRange.includes('/')
-      ? contentRange.split('/').pop()
-      : res.headers.get('content-length');
-    const totalSize = Number(rawTotal || 0);
-    if (!Number.isFinite(totalSize) || totalSize <= 0) return null;
-
-    // Only promote original stream when it is genuinely larger than the selected transcoded tier
-    if (selectedSizeBytes > 0 && totalSize <= selectedSizeBytes) {
-      return null;
-    }
-    return { url: finalUrl, sizeBytes: totalSize };
-  } catch {
-    return null;
-  } finally {
-    clearTimeout(timer);
-    options.signal?.removeEventListener('abort', onParentAbort);
+  const query = new URLSearchParams({
+    video_id: videoUri.trim(),
+    ratio: 'default',
+    line: '0',
+    is_play_url: '1',
+    watermark: '0',
+    source: 'PackSourceEnum_PUBLISH',
+  });
+  if (options.isNeedSetCookie) {
+    query.set('ss_is_p_v_ss', '1');
   }
+  const qs = query.toString();
+
+  // 1. Signed desktop /aweme/v1/play/ (X-Bogus signed, matching douyin-downloader CLI)
+  const signedDesktop = generateXBogus(
+    `https://www.douyin.com/aweme/v1/play/?${qs}`,
+    DEFAULT_XBOGUS_UA,
+  );
+  // 2. Mobile snssdk /aweme/v1/play/ (works even when web WAF blocks desktop play endpoint)
+  // 3. iesdouyin /aweme/v1/play/ fallback
+  const probeCandidates: Array<{ url: string; userAgent: string; referer: string }> = [
+    {
+      url: signedDesktop.signedUrl,
+      userAgent: signedDesktop.userAgent,
+      referer: 'https://www.douyin.com/',
+    },
+    {
+      url: `https://aweme.snssdk.com/aweme/v1/play/?${qs}`,
+      userAgent: MOBILE_PLAY_UA,
+      referer: 'https://www.iesdouyin.com/',
+    },
+    {
+      url: `https://www.iesdouyin.com/aweme/v1/play/?${qs}`,
+      userAgent: MOBILE_PLAY_UA,
+      referer: 'https://www.iesdouyin.com/',
+    },
+  ];
+
+  for (const candidate of probeCandidates) {
+    if (options.signal?.aborted) return null;
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 7_500);
+    const onParentAbort = () => controller.abort();
+    options.signal?.addEventListener('abort', onParentAbort, { once: true });
+
+    try {
+      const headers: Record<string, string> = {
+        'User-Agent': candidate.userAgent,
+        Referer: candidate.referer,
+        Accept: '*/*',
+        Range: 'bytes=0-0',
+      };
+      if (options.cookieString?.trim()) {
+        headers.Cookie = options.cookieString.trim();
+      }
+      const res = await fetchFn(candidate.url, {
+        method: 'GET',
+        headers,
+        redirect: 'follow',
+        signal: controller.signal,
+      });
+      if (res.status !== 200 && res.status !== 206) continue;
+      const ct = (res.headers.get('content-type') || '').toLowerCase();
+      if (!ct.startsWith('video/')) continue;
+
+      const finalUrl = res.url || candidate.url;
+      if (!isAllowedMediaHost(finalUrl)) continue;
+
+      const contentRange = res.headers.get('content-range') || '';
+      const rawTotal = contentRange.includes('/')
+        ? contentRange.split('/').pop()
+        : res.headers.get('content-length');
+      const totalSize = Number(rawTotal || 0);
+      if (!Number.isFinite(totalSize) || totalSize <= 0) continue;
+
+      // When source metadata proves a higher resolution exists (e.g. 2160x3840 source while
+      // web bit_rate capped at 1080x1920), allow promoting H.265 4K masters even if their
+      // byte size is close to an H.264 1080p track; otherwise strictly require larger size.
+      if (selectedSizeBytes > 0) {
+        const threshold = options.preferHigherResSource
+          ? Math.round(selectedSizeBytes * 0.65)
+          : selectedSizeBytes;
+        if (totalSize <= threshold) {
+          continue;
+        }
+      }
+      return { url: finalUrl, sizeBytes: totalSize, userAgent: candidate.userAgent };
+    } catch {
+      // try next probe endpoint
+    } finally {
+      clearTimeout(timer);
+      options.signal?.removeEventListener('abort', onParentAbort);
+    }
+  }
+
+  return null;
 }
 
 async function downloadBinaryFile(
@@ -149,6 +211,7 @@ async function downloadBinaryFile(
   destPath: string,
   options: {
     cookieString?: string;
+    userAgent?: string;
     accept?: string;
     adjustExtByContentType?: boolean;
     onProgress?: (received: number, total: number) => void;
@@ -160,7 +223,7 @@ async function downloadBinaryFile(
   }
 
   const headers: Record<string, string> = {
-    'User-Agent': DOWNLOAD_USER_AGENT,
+    'User-Agent': options.userAgent || DOWNLOAD_USER_AGENT,
     Referer: 'https://www.douyin.com/',
     Accept: options.accept || '*/*',
   };
@@ -350,14 +413,25 @@ export async function downloadAwemeMediaToDisk(
   } else if (settings.includeVideo && media.videoUrl) {
     const dest = path.join(itemDir, `${safeStem}.mp4`);
     let targetVideoUrl = media.videoUrl;
-    if (settings.videoQuality === 'original' && media.videoUri) {
-      options.onProgress?.(6, '正在探测上传原始画质流...');
+    let targetUserAgent: string | undefined;
+    const trackPixels = (media.width || 0) * (media.height || 0);
+    const sourcePixels = (media.sourceWidth || 0) * (media.sourceHeight || 0);
+    const hasHigherResSource = sourcePixels > 0 && trackPixels > 0 && sourcePixels > trackPixels;
+    const shouldProbeOriginal =
+      Boolean(media.videoUri) &&
+      (settings.videoQuality === 'original' || settings.videoQuality === 'highest');
+
+    if (shouldProbeOriginal && media.videoUri) {
+      options.onProgress?.(6, '正在探测更高清/原始画质视频流...');
       const probed = await probeOriginalVideoUrl(media.videoUri, media.sizeBytes, {
         cookieString: settings.cookieString,
+        isNeedSetCookie: media.isNeedSetCookie,
+        preferHigherResSource: hasHigherResSource,
         signal: options.signal,
       });
       if (probed?.url) {
         targetVideoUrl = probed.url;
+        targetUserAgent = probed.userAgent;
       }
     }
 
@@ -366,6 +440,7 @@ export async function downloadAwemeMediaToDisk(
     try {
       downloaded = await downloadBinaryFile(targetVideoUrl, dest, {
         cookieString: settings.cookieString,
+        userAgent: targetUserAgent,
         signal: options.signal,
         onProgress: (received, total) => {
           if (total > 0) {

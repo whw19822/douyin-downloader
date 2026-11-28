@@ -10,6 +10,7 @@ export interface ParsedAwemeMedia {
   mediaType: DouyinUrlType;
   videoUrl?: string;
   videoUri?: string;
+  isNeedSetCookie?: boolean;
   imageUrls: string[];
   coverUrl?: string;
   musicUrl?: string;
@@ -17,6 +18,8 @@ export interface ParsedAwemeMedia {
   sizeBytes: number;
   width?: number;
   height?: number;
+  sourceWidth?: number;
+  sourceHeight?: number;
   diggCount?: number;
   commentCount?: number;
   raw?: Record<string, unknown>;
@@ -92,6 +95,7 @@ export interface RawAweme {
   };
   video?: {
     vid?: string;
+    is_need_set_cookie?: number | boolean;
     play_addr?: RawUrlAddr;
     play_addr_h264?: RawUrlAddr;
     play_addr_265?: RawUrlAddr;
@@ -166,14 +170,20 @@ function upgradePlayEndpointRatio(url: string, quality: VideoQuality): string {
     if (!currentRatio) return url;
 
     const currentNum = Number(currentRatio.replace(/p$/i, '')) || 0;
-    if (quality === 'highest' || quality === 'original' || quality === '1080p') {
-      if (currentNum > 0 && currentNum < 1080) {
-        parsed.searchParams.set('ratio', '1080p');
+    if (quality === 'highest' || quality === 'original') {
+      // Never cap highest/original at 1080p: ratio=default delivers un-downscaled 2K/4K masters!
+      if (currentRatio !== 'default') {
+        parsed.searchParams.set('ratio', 'default');
         return parsed.toString();
       }
     } else if (quality === '1440p') {
       if (currentNum > 0 && currentNum < 1440) {
         parsed.searchParams.set('ratio', '1440p');
+        return parsed.toString();
+      }
+    } else if (quality === '1080p') {
+      if (currentNum > 0 && currentNum < 1080) {
+        parsed.searchParams.set('ratio', '1080p');
         return parsed.toString();
       }
     }
@@ -301,8 +311,28 @@ interface NormalizedVideoCandidate {
 export function pickBestVideoMedia(
   aweme: RawAweme,
   quality: VideoQuality,
-): { url?: string; uri?: string; sizeBytes: number; width?: number; height?: number } {
+): {
+  url?: string;
+  uri?: string;
+  isNeedSetCookie?: boolean;
+  sizeBytes: number;
+  width?: number;
+  height?: number;
+  sourceWidth?: number;
+  sourceHeight?: number;
+} {
   const video = aweme.video;
+  const sourceWidth = Math.max(
+    0,
+    Math.round(Number(video?.width || video?.play_addr?.width || 0) || 0),
+  ) || undefined;
+  const sourceHeight = Math.max(
+    0,
+    Math.round(Number(video?.height || video?.play_addr?.height || 0) || 0),
+  ) || undefined;
+  const isNeedSetCookie = Boolean(video?.is_need_set_cookie);
+  const canonicalUri = video?.play_addr?.uri || video?.vid;
+
   const candidates: NormalizedVideoCandidate[] = [];
   const seenUrls = new Set<string>();
 
@@ -317,7 +347,7 @@ export function pickBestVideoMedia(
     const res = computeTrackResolution(meta, addr);
     candidates.push({
       url,
-      uri: addr.uri || video?.vid,
+      uri: addr.uri || canonicalUri,
       bitRate: Math.max(0, Number(meta.bitRate || 0) || 0),
       dataSize: Math.max(0, Number(addr.data_size || 0) || 0),
       width: res.width,
@@ -347,18 +377,21 @@ export function pickBestVideoMedia(
     }
   }
 
-  // Also inspect top-level play_addr variants when bit_rate is absent or lacks a higher-res track
-  const topLevelAddrs = [
-    video?.play_addr,
-    video?.play_addr_h264,
-    video?.play_addr_265,
-    video?.play_addr_256,
-    video?.play_addr_bytevc1,
-  ];
-  for (const addr of topLevelAddrs) {
-    if (!addr) continue;
-    // Only include top-level addrs when bit_rate is empty OR top-level provides explicit dimensions
-    if (candidates.length === 0 || (addr.width && addr.height)) {
+  // IMPORTANT: On Douyin, top-level video.play_addr often carries the original source dimensions
+  // (e.g. 2160x3840) even though its url_list serves a downscaled 1080p/720p playback stream.
+  // Only fall back to top-level play_addr variants when video.bit_rate has no usable tracks!
+  const cameFromBitRate = candidates.length > 0;
+  if (!cameFromBitRate) {
+    const topLevelAddrs = [
+      video?.play_addr_h264,
+      video?.play_addr_265,
+      video?.play_addr_256,
+      video?.play_addr_bytevc1,
+      video?.play_addr,
+      video?.download_addr,
+    ];
+    for (const addr of topLevelAddrs) {
+      if (!addr) continue;
       pushCandidate(addr, {
         width: addr.width || video?.width,
         height: addr.height || video?.height,
@@ -366,20 +399,16 @@ export function pickBestVideoMedia(
     }
   }
 
-  if (candidates.length === 0 && video?.download_addr) {
-    pushCandidate(video.download_addr, {
-      width: video.download_addr.width || video.width,
-      height: video.download_addr.height || video.height,
-    });
-  }
-
   if (candidates.length === 0) {
     return {
       url: undefined,
-      uri: video?.vid,
+      uri: canonicalUri,
+      isNeedSetCookie,
       sizeBytes: 0,
-      width: video?.width,
-      height: video?.height,
+      width: sourceWidth,
+      height: sourceHeight,
+      sourceWidth,
+      sourceHeight,
     };
   }
 
@@ -389,7 +418,6 @@ export function pickBestVideoMedia(
       const brA = a.bitRate || Number.MAX_SAFE_INTEGER;
       const brB = b.bitRate || Number.MAX_SAFE_INTEGER;
       if (a.pixels !== b.pixels && a.pixels > 0 && b.pixels > 0) {
-        // Prefer lowest bitrate; if bitrates are missing, fall back to lowest resolution
         if (brA !== brB) return brA - brB;
         return a.pixels - b.pixels;
       }
@@ -408,9 +436,8 @@ export function pickBestVideoMedia(
       return b.dataSize - a.dataSize;
     });
   } else {
-    // 'highest' and 'original' (base tier before optional original probe):
-    // Always prioritize highest pixel resolution first (so 1080p/2K/4K H.265 beats 720p H.264),
-    // then highest bit_rate within the same resolution, then data_size as tie-breaker.
+    // 'highest' and 'original' (base tier before original-master probe):
+    // Prioritize highest actual track pixel resolution first, then highest bit_rate, then data_size.
     sorted.sort((a, b) => {
       if (b.pixels !== a.pixels) return b.pixels - a.pixels;
       if (b.shortEdge !== a.shortEdge) return b.shortEdge - a.shortEdge;
@@ -422,10 +449,14 @@ export function pickBestVideoMedia(
   const chosen = sorted[0];
   return {
     url: chosen.url,
-    uri: chosen.uri || video?.play_addr?.uri || video?.vid,
+    // Prefer canonical video URI (video.play_addr.uri / video.vid) for /aweme/v1/play/?ratio=default probing
+    uri: canonicalUri || chosen.uri,
+    isNeedSetCookie,
     sizeBytes: chosen.dataSize,
-    width: chosen.width || video?.width,
-    height: chosen.height || video?.height,
+    width: chosen.width || (!cameFromBitRate ? sourceWidth : undefined),
+    height: chosen.height || (!cameFromBitRate ? sourceHeight : undefined),
+    sourceWidth,
+    sourceHeight,
   };
 }
 
@@ -622,6 +653,7 @@ export function parseAwemeToMedia(
     mediaType: isGallery ? 'gallery' : 'video',
     videoUrl: isGallery ? undefined : videoPicked.url,
     videoUri: isGallery ? undefined : videoPicked.uri,
+    isNeedSetCookie: isGallery ? undefined : videoPicked.isNeedSetCookie,
     imageUrls,
     coverUrl,
     musicUrl,
@@ -629,6 +661,8 @@ export function parseAwemeToMedia(
     sizeBytes: isGallery ? 0 : videoPicked.sizeBytes,
     width: isGallery ? undefined : videoPicked.width,
     height: isGallery ? undefined : videoPicked.height,
+    sourceWidth: isGallery ? undefined : videoPicked.sourceWidth,
+    sourceHeight: isGallery ? undefined : videoPicked.sourceHeight,
     diggCount: aweme.statistics?.digg_count,
     commentCount: aweme.statistics?.comment_count,
     raw: aweme as unknown as Record<string, unknown>,
